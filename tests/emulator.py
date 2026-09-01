@@ -43,6 +43,9 @@ class Emulator(asyncio.Protocol):
     reject_next_set = False
     #: Which ID banner to report.
     id_banner = ID_GEN1
+    #: LIMITS functions the device silently ignores, as real units do for
+    #: capabilities they do not have.
+    unanswered_limits: set[str] = set()
     #: Live connections, so a test can drop them.
     connections: list[Emulator] = []
 
@@ -57,6 +60,7 @@ class Emulator(asyncio.Protocol):
         cls.tear_frames = False
         cls.reject_next_set = False
         cls.id_banner = ID_GEN1
+        cls.unanswered_limits = set()
         cls.connections = []
 
     @classmethod
@@ -105,6 +109,8 @@ class Emulator(asyncio.Protocol):
             self.send("ACK\r\n")
         elif line.startswith("LIMITS:"):
             function = line.split(":", 1)[1]
+            if function in Emulator.unanswered_limits:
+                return
             if function in LIMITS:
                 self.send(f"LIMITS:{function},{LIMITS[function]}\r\n")
         elif head == "GET":

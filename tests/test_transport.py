@@ -117,6 +117,40 @@ async def test_ready_waits_for_limits(port):
         box.stop()
 
 
+async def test_ready_when_device_ignores_a_limits_query(port):
+    """A unit that never answers LIMITS:VANELR must still come up.
+
+    Real units silently ignore queries for capabilities they do not have. A
+    readiness gate that waits for all five replies would leave every entity
+    unavailable rather than degrading to the capabilities it does know about.
+    """
+    Emulator.unanswered_limits = {"VANELR"}
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        assert await box.async_connect(timeout=20)
+        assert box.is_initialized
+        # Everything the device did answer is still populated.
+        assert box.operation_list == ["AUTO", "HEAT", "DRY", "COOL", "FAN"]
+        assert box.fan_speed_list == ["AUTO", "1", "2", "3", "4"]
+        assert box.vane_vertical_list == ["AUTO", "1", "2", "3", "SWING"]
+        # The unanswered one is simply empty, not fatal.
+        assert box.vane_horizontal_list == []
+    finally:
+        box.stop()
+
+
+async def test_ready_on_id_alone_when_no_limits_answered(port):
+    """A device that answers only ID must still come up, with empty limits."""
+    Emulator.unanswered_limits = {"SETPTEMP", "FANSP", "MODE", "VANEUD", "VANELR"}
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        # ID is still answered, so this comes up on the grace path.
+        assert await box.async_connect(timeout=20)
+        assert box.device_mac_address == "001DC9A2C911"
+    finally:
+        box.stop()
+
+
 async def test_set_mode_confirms_before_power_on(port):
     """Mode is confirmed from the device's own push, not by polling 30 times."""
     box = await _connected_box(port)

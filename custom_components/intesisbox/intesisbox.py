@@ -59,16 +59,24 @@ COMMAND_INTERVAL = 0.2
 # How long to wait for the device to confirm a mode change before giving up.
 CONFIRM_TIMEOUT = 10
 
-# Commands sent on connect. The device is not considered ready until every one
-# of these has been answered.
-INIT_COMMANDS = [
-    "ID",
+# Commands sent on connect. ID is mandatory - without it we have no device
+# identity. The LIMITS queries are best effort: not every unit answers every
+# one (a device with no left/right vane may simply ignore LIMITS:VANELR), and
+# refusing to become ready in that case would be a worse failure than starting
+# with an incomplete picture of the device's capabilities.
+INIT_REQUIRED = ["ID"]
+INIT_OPTIONAL = [
     f"LIMITS:{FUNCTION_SETPOINT}",
     f"LIMITS:{FUNCTION_FANSP}",
     f"LIMITS:{FUNCTION_MODE}",
     f"LIMITS:{FUNCTION_VANEUD}",
     f"LIMITS:{FUNCTION_VANELR}",
 ]
+INIT_COMMANDS = INIT_REQUIRED + INIT_OPTIONAL
+
+# How long to keep waiting for the optional LIMITS replies once ID has arrived,
+# before giving up on the stragglers and becoming ready anyway.
+LIMITS_GRACE = 5
 
 background_tasks = set()
 
@@ -419,9 +427,40 @@ class IntesisBox(asyncio.Protocol):
             # Not mid-handshake; this is an unsolicited or late reply.
             return
         self._pending_init.discard(cmd)
-        if self._pending_init or self._ready.is_set():
+
+        if self._ready.is_set():
             return
 
+        if self._pending_init:
+            # Everything mandatory answered, only optional replies outstanding:
+            # start the grace timer rather than waiting indefinitely.
+            if not self._pending_init & set(INIT_REQUIRED):
+                self._start_task("limits_grace", self._limits_grace())
+            return
+
+        self._become_ready()
+
+    async def _limits_grace(self) -> None:
+        """Become ready once the stragglers have had long enough to answer."""
+        await asyncio.sleep(LIMITS_GRACE)
+        if self._ready.is_set():
+            return
+        _LOGGER.warning(
+            "IntesisBox %s did not answer %s; continuing without those limits",
+            self._ip,
+            ", ".join(sorted(self._pending_init)),
+        )
+        self._become_ready()
+
+    def _become_ready(self) -> None:
+        """Mark the device ready and start the periodic tasks."""
+        # Guard against cancelling the grace task from inside itself.
+        grace = self._tasks.get("limits_grace")
+        if grace is not None and grace is not asyncio.current_task():
+            self._cancel_task("limits_grace")
+        else:
+            self._tasks.pop("limits_grace", None)
+        self._pending_init.clear()
         self._connectionStatus = API_AUTHENTICATED
         self._ready.set()
         _LOGGER.debug("IntesisBox %s ready", self._ip)
