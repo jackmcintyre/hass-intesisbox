@@ -72,11 +72,21 @@ INIT_OPTIONAL = [
     f"LIMITS:{FUNCTION_VANEUD}",
     f"LIMITS:{FUNCTION_VANELR}",
 ]
-INIT_COMMANDS = INIT_REQUIRED + INIT_OPTIONAL
+# A full status dump is part of the handshake, not just the periodic poll: the
+# set of functions a device reports is how we discover which vane axes it
+# actually has, and the entity needs that before it can declare its features.
+INIT_AWAITED = INIT_REQUIRED + INIT_OPTIONAL
+INIT_COMMANDS = INIT_AWAITED + ["GET,1:*"]
 
-# How long to keep waiting for the optional LIMITS replies once ID has arrived,
-# before giving up on the stragglers and becoming ready anyway.
+# Once ID has arrived, wait this long for the rest of the handshake - the LIMITS
+# replies and the status dump - before becoming ready with whatever turned up.
 LIMITS_GRACE = 5
+
+# Vane positions offered when the device does not answer LIMITS for that axis.
+# The spec (§3) allows AUTO, 1-9 and SWING; most units expose about five
+# positions, and any the unit rejects now surface as an ERR rather than failing
+# silently. Positions the device actually reports are added to this set.
+DEFAULT_VANE_POSITIONS = ["AUTO", "1", "2", "3", "4", "5", "SWING"]
 
 background_tasks = set()
 
@@ -182,7 +192,7 @@ class IntesisBox(asyncio.Protocol):
         self._buffer = b""
         self._connectionStatus = API_CONNECTING
         self._ready.clear()
-        self._pending_init = set(INIT_COMMANDS)
+        self._pending_init = set(INIT_AWAITED)
 
         # Drain anything queued while disconnected; it refers to a dead socket.
         while not self._write_queue.empty():
@@ -438,18 +448,21 @@ class IntesisBox(asyncio.Protocol):
                 self._start_task("limits_grace", self._limits_grace())
             return
 
-        self._become_ready()
+        # Even with every reply in, wait out the settle window so the status
+        # dump lands before anyone reads our capabilities.
+        self._start_task("limits_grace", self._limits_grace())
 
     async def _limits_grace(self) -> None:
         """Become ready once the stragglers have had long enough to answer."""
         await asyncio.sleep(LIMITS_GRACE)
         if self._ready.is_set():
             return
-        _LOGGER.warning(
-            "IntesisBox %s did not answer %s; continuing without those limits",
-            self._ip,
-            ", ".join(sorted(self._pending_init)),
-        )
+        if self._pending_init:
+            _LOGGER.warning(
+                "IntesisBox %s did not answer %s; continuing without those limits",
+                self._ip,
+                ", ".join(sorted(self._pending_init)),
+            )
         self._become_ready()
 
     def _become_ready(self) -> None:
@@ -668,15 +681,45 @@ class IntesisBox(asyncio.Protocol):
         """Supported modes."""
         return self._operation_list
 
+    def _vane_list(self, function: str, reported: list[str]) -> list[str]:
+        """Return the usable positions for one vane axis.
+
+        Capability cannot be taken from LIMITS alone: units are observed to
+        ignore LIMITS:VANEUD and LIMITS:VANELR entirely while still reporting
+        and accepting vane positions. What the device includes in its status
+        dump is the reliable signal - an axis it never mentions is an axis it
+        does not have.
+        """
+        if reported:
+            return reported
+        current = self._device.get(function)
+        if current is None:
+            return []
+        positions = list(DEFAULT_VANE_POSITIONS)
+        if current not in positions:
+            # Trust the device over our defaults, keeping SWING last.
+            positions.insert(len(positions) - 1, current)
+        return positions
+
     @property
     def vane_horizontal_list(self) -> list[str]:
         """Supported Horizontal Vane settings."""
-        return self._horizontal_vane_list
+        return self._vane_list(FUNCTION_VANELR, self._horizontal_vane_list)
 
     @property
     def vane_vertical_list(self) -> list[str]:
         """Supported Vertical Vane settings."""
-        return self._vertical_vane_list
+        return self._vane_list(FUNCTION_VANEUD, self._vertical_vane_list)
+
+    @property
+    def has_vertical_vane(self) -> bool:
+        """Whether this unit has an up/down vane."""
+        return len(self.vane_vertical_list) > 1
+
+    @property
+    def has_horizontal_vane(self) -> bool:
+        """Whether this unit has a left/right vane."""
+        return len(self.vane_horizontal_list) > 1
 
     @property
     def mode(self) -> str | None:
@@ -715,8 +758,8 @@ class IntesisBox(asyncio.Protocol):
 
     @property
     def has_swing_control(self) -> bool:
-        """Return true if the device supports swing modes."""
-        return len(self._horizontal_vane_list) > 1 or len(self._vertical_vane_list) > 1
+        """Return true if the device supports either vane axis."""
+        return self.has_vertical_vane or self.has_horizontal_vane
 
     @property
     def setpoint(self) -> float | None:

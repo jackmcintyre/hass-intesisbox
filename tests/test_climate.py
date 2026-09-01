@@ -75,9 +75,19 @@ class FakeController:
         self._update_callbacks = []
 
     @property
-    def has_swing_control(self) -> bool:
+    def has_vertical_vane(self) -> bool:
         """Mirror the real controller's capability test."""
-        return len(self.vane_horizontal_list) > 1 or len(self.vane_vertical_list) > 1
+        return len(self.vane_vertical_list) > 1
+
+    @property
+    def has_horizontal_vane(self) -> bool:
+        """Mirror the real controller's capability test."""
+        return len(self.vane_horizontal_list) > 1
+
+    @property
+    def has_swing_control(self) -> bool:
+        """True if either axis exists."""
+        return self.has_vertical_vane or self.has_horizontal_vane
 
     def add_update_callback(self, method):
         """Record the entity's callback."""
@@ -251,23 +261,71 @@ def test_no_usable_modes_raises_not_ready():
 # --------------------------------------------------------------------------
 
 
-def test_no_swing_feature_when_device_ignores_vane_limits():
-    """Real units never answer LIMITS:VANEUD, leaving the lists empty."""
+def test_no_swing_feature_when_unit_has_no_vanes():
+    """A unit that reports no vane function at all gets no swing control."""
     entity = make_entity(FakeController())
     assert not entity.supported_features & ClimateEntityFeature.SWING_MODE
+    assert not entity.supported_features & ClimateEntityFeature.SWING_HORIZONTAL_MODE
     assert entity.swing_modes == []
-    assert "swing_mode" not in entity.state_attributes
 
 
-def test_swing_feature_when_vane_limits_are_reported():
-    """A device that does answer gets swing control."""
+def test_vertical_only_unit_gets_vertical_swing_only():
+    """Real units report VANEUD and no VANELR, so only one axis is offered."""
     controller = FakeController(
-        vertical_vane_list=["AUTO", "1", "2", "SWING"],
-        horizontal_vane_list=["AUTO", "1", "2", "SWING"],
+        vertical_vane_list=["AUTO", "1", "2", "3", "4", "5", "SWING"],
     )
     entity = make_entity(controller)
     assert entity.supported_features & ClimateEntityFeature.SWING_MODE
-    assert "Both" in entity.swing_modes
+    assert not entity.supported_features & ClimateEntityFeature.SWING_HORIZONTAL_MODE
+    assert entity.swing_modes == ["auto", "1", "2", "3", "4", "5", "swing"]
+    assert entity.swing_horizontal_modes == []
+
+
+def test_both_axes_when_unit_reports_both():
+    """A unit with both vanes gets both, mapped to separate HA features."""
+    controller = FakeController(
+        vertical_vane_list=["AUTO", "1", "SWING"],
+        horizontal_vane_list=["AUTO", "1", "SWING"],
+    )
+    entity = make_entity(controller)
+    assert entity.supported_features & ClimateEntityFeature.SWING_MODE
+    assert entity.supported_features & ClimateEntityFeature.SWING_HORIZONTAL_MODE
+    assert entity.swing_horizontal_modes == ["auto", "1", "swing"]
+
+
+async def test_setting_a_vane_position_writes_the_device_value():
+    """Position 3 must reach the device as 3, and auto as AUTO."""
+    controller = FakeController(vertical_vane_list=["AUTO", "1", "2", "3", "SWING"])
+    entity = make_entity(controller)
+
+    await entity.async_set_swing_mode("3")
+    await entity.async_set_swing_mode("auto")
+    await entity.async_set_swing_mode("swing")
+
+    assert controller.calls == [
+        ("vane_ud", "3"),
+        ("vane_ud", "AUTO"),
+        ("vane_ud", "SWING"),
+    ]
+
+
+async def test_horizontal_axis_writes_the_other_function():
+    """The left/right axis must not be written to the up/down function."""
+    controller = FakeController(horizontal_vane_list=["AUTO", "1", "SWING"])
+    entity = make_entity(controller)
+
+    await entity.async_set_swing_horizontal_mode("1")
+
+    assert controller.calls == [("vane_lr", "1")]
+
+
+def test_current_vane_position_is_reported():
+    """A discrete position must be reported, not flattened to on/off."""
+    controller = FakeController(vertical_vane_list=["AUTO", "1", "2", "3", "SWING"])
+    controller.vertical_swing = "3"
+    entity = make_entity(controller)
+    entity._vane_vertical = "3"
+    assert entity.swing_mode == "3"
 
 
 def test_turn_on_off_features_advertised():
