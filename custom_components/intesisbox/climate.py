@@ -150,8 +150,6 @@ class IntesisBoxAC(ClimateEntity):
         self._vane_horizontal = None
         self._power = False
         self._current_operation = STATE_UNKNOWN
-        self._has_vertical_vane = controller.has_vertical_vane
-        self._has_horizontal_vane = controller.has_horizontal_vane
 
         # Setup fan list
         self._fan_list = [x.title() for x in self._controller.fan_speed_list]
@@ -192,10 +190,10 @@ class IntesisBoxAC(ClimateEntity):
         self._swing_horizontal_list = [
             vane_to_ha(v) for v in self._controller.vane_horizontal_list
         ]
-        if self._has_vertical_vane:
-            self._base_features |= ClimateEntityFeature.SWING_MODE
-        if self._has_horizontal_vane:
-            self._base_features |= ClimateEntityFeature.SWING_HORIZONTAL_MODE
+        # Swing features are not folded into _base_features: a unit that
+        # reports a vane position but refuses to be commanded to one is only
+        # discovered when it rejects a write, so the feature has to be able to
+        # disappear at runtime. See supported_features.
 
         _LOGGER.debug("Finished setting up climate entity!")
         self._controller.add_update_callback(self.update_callback)
@@ -229,10 +227,12 @@ class IntesisBoxAC(ClimateEntity):
     @property
     def extra_state_attributes(self):
         """Return the device specific state attributes."""
+        # Position is still reported even where the vane cannot be commanded -
+        # reading it works on hardware where writing does not.
         attrs = {}
-        if self._has_vertical_vane:
+        if self._vane_vertical is not None:
             attrs["vertical_swing"] = self._vane_vertical
-        if self._has_horizontal_vane:
+        if self._vane_horizontal is not None:
             attrs["horizontal_swing"] = self._vane_horizontal
 
         if self._controller.is_connected:
@@ -390,11 +390,15 @@ class IntesisBoxAC(ClimateEntity):
     @property
     def swing_modes(self):
         """Available up/down vane positions."""
+        if not self._controller.has_vertical_vane:
+            return []
         return self._swing_list
 
     @property
     def swing_horizontal_modes(self):
         """Available left/right vane positions."""
+        if not self._controller.has_horizontal_vane:
+            return []
         return self._swing_horizontal_list
 
     @property
@@ -432,5 +436,15 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def supported_features(self):
-        """Return the list of supported features."""
-        return self._base_features
+        """Return the currently supported features.
+
+        Swing is evaluated per read rather than cached, because a vane the
+        device refuses to set is only discovered from an ERR after the entity
+        already exists.
+        """
+        features = self._base_features
+        if self._controller.has_vertical_vane:
+            features |= ClimateEntityFeature.SWING_MODE
+        if self._controller.has_horizontal_vane:
+            features |= ClimateEntityFeature.SWING_HORIZONTAL_MODE
+        return features

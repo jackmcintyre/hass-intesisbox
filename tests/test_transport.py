@@ -188,6 +188,46 @@ async def test_reported_position_outside_defaults_is_offered(port):
         box.stop()
 
 
+async def test_refused_vane_write_drops_the_capability(port):
+    """A unit that reports a vane but refuses to set it must stop offering it.
+
+    Observed on five TO-RC-WMP-1 gateways: they report CHN,1:VANEUD faithfully,
+    move the vane themselves, and answer ERR to every SET,1:VANEUD - whether
+    the unit is off or running, and for AUTO as well as numbered positions.
+    """
+    Emulator.unanswered_limits = {"VANEUD", "VANELR"}
+    Emulator.absent_functions = {"VANELR"}
+    Emulator.readonly_functions = {"VANEUD"}
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        assert await box.async_connect(timeout=20)
+        # Before anyone tries, the axis looks settable.
+        assert box.has_vertical_vane
+
+        await box.async_set_vertical_vane("3")
+        await asyncio.sleep(1.5)
+
+        # The refusal is learned, not assumed.
+        assert not box.has_vertical_vane
+        # Position is still read, because reading works where writing does not.
+        assert box.vertical_swing == "AUTO"
+    finally:
+        box.stop()
+
+
+async def test_unrelated_error_does_not_drop_a_capability(port):
+    """An ERR for something else must not be blamed on the vane."""
+    box = await _connected_box(port)
+    try:
+        assert box.has_vertical_vane
+        Emulator.reject_next_set = True
+        await box.async_set_fan_speed("9")
+        await asyncio.sleep(1.5)
+        assert box.has_vertical_vane
+    finally:
+        box.stop()
+
+
 async def test_set_mode_confirms_before_power_on(port):
     """Mode is confirmed from the device's own push, not by polling 30 times."""
     box = await _connected_box(port)
