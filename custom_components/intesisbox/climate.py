@@ -250,10 +250,6 @@ class IntesisBoxAC(ClimateEntity):
         else:
             await self._controller.async_set_mode(MAP_OPERATION_MODE_TO_IB[hvac_mode])
 
-            # Send the temperature again in case changing modes has changed it
-            if self._target_temperature:
-                await self._controller.async_set_temperature(self._target_temperature)
-
         self.async_write_ha_state()
 
     async def async_turn_on(self):
@@ -413,10 +409,14 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def target_temperature(self):
-        """Return the current setpoint temperature if unit is on and not FAN or OFF Mode."""
-        if self._power and self.hvac_mode not in [HVACMode.FAN_ONLY, HVACMode.OFF]:
-            return self._target_temperature
-        return None
+        """Return the set point the device is reporting.
+
+        No need to second-guess this by power state: the device reports a null
+        set point (32768, mapped to None) in modes where one does not apply, so
+        FAN mode already yields None on its own. Suppressing it while the unit
+        is merely off just loses the value from the card and from history.
+        """
+        return self._target_temperature
 
     @property
     def supported_features(self):
