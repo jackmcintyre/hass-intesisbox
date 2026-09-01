@@ -82,6 +82,11 @@ INIT_COMMANDS = INIT_AWAITED + ["GET,1:*"]
 # replies and the status dump - before becoming ready with whatever turned up.
 LIMITS_GRACE = 5
 
+# An ERR arriving within this long of a command is attributed to it. Commands
+# are serialised and devices answer in tens of milliseconds, so this is ample
+# without risking blaming an unrelated command for a late or stray ERR.
+ERR_ATTRIBUTION_WINDOW = 2.0
+
 # Vane positions offered when the device does not answer LIMITS for that axis.
 # The spec (§3) allows AUTO, 1-9 and SWING; most units expose about five
 # positions, and any the unit rejects now surface as an ERR rather than failing
@@ -148,6 +153,18 @@ class IntesisBox(asyncio.Protocol):
         # Owned tasks, cancelled and replaced on every (re)connect.
         self._tasks: dict[str, asyncio.Task] = {}
         self._stopped = False
+
+        # The last command sent, so a bare ERR can be attributed to it.
+        self._last_command: str | None = None
+        self._last_command_at: float = 0.0
+
+        # Some units report a vane position but refuse to be commanded to one.
+        # Learned from an ERR rather than assumed, and reset on reconnect only
+        # if the device is replaced.
+        self._vane_settable: dict[str, bool] = {
+            FUNCTION_VANEUD: True,
+            FUNCTION_VANELR: True,
+        }
 
         # Limits
         self._operation_list: list[str] = []
@@ -331,6 +348,8 @@ class IntesisBox(asyncio.Protocol):
             except Exception as exc:  # noqa: BLE001 - surface, do not crash writer
                 _LOGGER.error("Failed to send %r: %r", cmd, exc)
                 continue
+            self._last_command = cmd
+            self._last_command_at = self._eventLoop.time()
             _LOGGER.debug("Data sent: %r", cmd)
             await asyncio.sleep(COMMAND_INTERVAL)
 
@@ -407,10 +426,9 @@ class IntesisBox(asyncio.Protocol):
         if line == "ERR":
             # The spec (§FAQs) returns a bare ERR for an invalid value or a
             # write to a read-only function, with no indication of which
-            # command failed.
-            _LOGGER.warning("IntesisBox %s rejected a command", self._ip)
-            self._send_error_callback("Device rejected the command")
-            return False
+            # command failed. Commands are serialised and answered in tens of
+            # milliseconds, so the most recent one is a sound attribution.
+            return self._handle_error_response()
 
         cmdList = line.split(":", 1)
         if len(cmdList) < 2:
@@ -429,6 +447,38 @@ class IntesisBox(asyncio.Protocol):
             if function:
                 self._mark_init_complete(f"LIMITS:{function}")
             return True
+        return False
+
+    def _handle_error_response(self) -> bool:
+        """Attribute a bare ERR to the command that most likely caused it."""
+        recent = (
+            self._last_command
+            if self._eventLoop
+            and (self._eventLoop.time() - self._last_command_at)
+            <= ERR_ATTRIBUTION_WINDOW
+            else None
+        )
+
+        if recent:
+            _LOGGER.warning("IntesisBox %s rejected %r", self._ip, recent)
+        else:
+            _LOGGER.warning("IntesisBox %s rejected a command", self._ip)
+        self._send_error_callback(f"Device rejected {recent or 'a command'}")
+
+        # A refused vane write means this unit reports its vane position but
+        # will not be commanded to one. Stop offering the control rather than
+        # presenting one that always fails.
+        if recent and recent.startswith("SET,1:"):
+            function = recent.split(":", 1)[1].split(",", 1)[0]
+            if function in self._vane_settable and self._vane_settable[function]:
+                self._vane_settable[function] = False
+                _LOGGER.warning(
+                    "IntesisBox %s refuses to set %s; treating that vane as "
+                    "read-only for this session",
+                    self._ip,
+                    function,
+                )
+                return True
         return False
 
     def _mark_init_complete(self, cmd: str) -> None:
@@ -713,13 +763,15 @@ class IntesisBox(asyncio.Protocol):
 
     @property
     def has_vertical_vane(self) -> bool:
-        """Whether this unit has an up/down vane."""
-        return len(self.vane_vertical_list) > 1
+        """Whether the up/down vane exists and accepts commands."""
+        return len(self.vane_vertical_list) > 1 and self._vane_settable[FUNCTION_VANEUD]
 
     @property
     def has_horizontal_vane(self) -> bool:
-        """Whether this unit has a left/right vane."""
-        return len(self.vane_horizontal_list) > 1
+        """Whether the left/right vane exists and accepts commands."""
+        return (
+            len(self.vane_horizontal_list) > 1 and self._vane_settable[FUNCTION_VANELR]
+        )
 
     @property
     def mode(self) -> str | None:

@@ -49,6 +49,9 @@ class Emulator(asyncio.Protocol):
     #: Functions absent from the device entirely - a unit with no left/right
     #: vane never mentions VANELR in its status dump.
     absent_functions: set[str] = set()
+    #: Functions the device reports but refuses to be commanded to. Observed
+    #: on TO-RC-WMP-1, which reports VANEUD and rejects every SET for it.
+    readonly_functions: set[str] = set()
     #: Live connections, so a test can drop them.
     connections: list[Emulator] = []
 
@@ -67,6 +70,7 @@ class Emulator(asyncio.Protocol):
         cls.id_banner = ID_GEN1
         cls.unanswered_limits = set()
         cls.absent_functions = set()
+        cls.readonly_functions = set()
         cls.connections = []
 
     @classmethod
@@ -135,6 +139,9 @@ class Emulator(asyncio.Protocol):
                 return
             payload = line.split(":", 1)[1]
             function, value = payload.split(",", 1)
+            if function in Emulator.readonly_functions:
+                self.send("ERR\r\n")
+                return
             self.send("ACK\r\n")
             if self.state.get(function) != value:
                 self.state[function] = value
