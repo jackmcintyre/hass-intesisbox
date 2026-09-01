@@ -147,12 +147,22 @@ class IntesisBoxAC(ClimateEntity):
             raise PlatformNotReady("Controller hasn't finished initializing device")
         self._fan_speed = None
 
-        # Setup operation list
+        # Setup operation list. A mode the device reports but we cannot map is
+        # skipped with a warning rather than raising, so one unrecognised token
+        # does not cost the user every other mode on the unit.
         self._operation_list = [HVACMode.OFF]
         for operation in self._controller.operation_list:
-            self._operation_list.append(MAP_OPERATION_MODE_TO_HA[operation])
+            hvac_mode = MAP_OPERATION_MODE_TO_HA.get(operation)
+            if hvac_mode is None:
+                _LOGGER.warning(
+                    "Ignoring unsupported operation mode %r reported by %s",
+                    operation,
+                    controller.device_mac_address,
+                )
+                continue
+            self._operation_list.append(hvac_mode)
         if len(self._operation_list) == 1:
-            raise PlatformNotReady
+            raise PlatformNotReady("Controller reported no usable operation modes")
 
         # Setup feature support
         self._base_features = ClimateEntityFeature.TARGET_TEMPERATURE
