@@ -133,8 +133,10 @@ async def test_ready_when_device_ignores_a_limits_query(port):
         assert box.operation_list == ["AUTO", "HEAT", "DRY", "COOL", "FAN"]
         assert box.fan_speed_list == ["AUTO", "1", "2", "3", "4"]
         assert box.vane_vertical_list == ["AUTO", "1", "2", "3", "SWING"]
-        # The unanswered one is simply empty, not fatal.
-        assert box.vane_horizontal_list == []
+        # LIMITS:VANELR went unanswered, but the device reports VANELR in its
+        # status dump, so the axis is inferred and offered with defaults.
+        assert box.vane_horizontal_list == intesisbox.DEFAULT_VANE_POSITIONS
+        assert box.has_horizontal_vane
     finally:
         box.stop()
 
@@ -147,6 +149,41 @@ async def test_ready_on_id_alone_when_no_limits_answered(port):
         # ID is still answered, so this comes up on the grace path.
         assert await box.async_connect(timeout=20)
         assert box.device_mac_address == "001DC9A2C911"
+    finally:
+        box.stop()
+
+
+async def test_vertical_only_unit_infers_one_axis(port):
+    """The shape real hardware presents: VANEUD reported, VANELR absent.
+
+    Observed on five live units - they ignore both LIMITS vane queries and
+    never mention VANELR at all, so capability has to come from the status
+    dump rather than from LIMITS.
+    """
+    Emulator.unanswered_limits = {"VANEUD", "VANELR"}
+    Emulator.absent_functions = {"VANELR"}
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        assert await box.async_connect(timeout=20)
+        assert box.has_vertical_vane
+        assert not box.has_horizontal_vane
+        assert box.vane_vertical_list == intesisbox.DEFAULT_VANE_POSITIONS
+        assert box.vane_horizontal_list == []
+    finally:
+        box.stop()
+
+
+async def test_reported_position_outside_defaults_is_offered(port):
+    """A position the device reports must be selectable even if unusual."""
+    Emulator.unanswered_limits = {"VANEUD", "VANELR"}
+    Emulator.absent_functions = {"VANELR"}
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        assert await box.async_connect(timeout=20)
+        box.data_received(b"CHN,1:VANEUD,8\r\n")
+        assert "8" in box.vane_vertical_list
+        # SWING stays last so the list reads sensibly.
+        assert box.vane_vertical_list[-1] == "SWING"
     finally:
         box.stop()
 

@@ -81,10 +81,22 @@ FAN_MODE_E_TO_I = {v: k for k, v in FAN_MODE_I_TO_E.items()}
 
 SWING_ON = "SWING"
 SWING_STOP = "AUTO"
-SWING_LIST_HORIZONTAL = "Horizontal"
-SWING_LIST_VERTICAL = "Vertical"
-SWING_LIST_BOTH = "Both"
-SWING_LIST_STOP = "Auto"
+
+# The device speaks AUTO, 1-9 and SWING on each vane axis. Present those as
+# readable labels rather than raw protocol tokens.
+VANE_I_TO_E = {"AUTO": "auto", "SWING": "swing"}
+
+
+def vane_to_ha(value: str | None) -> str | None:
+    """Map a device vane value to the mode shown in Home Assistant."""
+    if value is None:
+        return None
+    return VANE_I_TO_E.get(value.upper(), value)
+
+
+def vane_to_device(mode: str) -> str:
+    """Map a Home Assistant swing mode back to the device value."""
+    return {v: k for k, v in VANE_I_TO_E.items()}.get(mode, mode).upper()
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
@@ -134,12 +146,12 @@ class IntesisBoxAC(ClimateEntity):
         self._target_temperature = None
         self._current_temp = None
         self._rssi = None
-        self._swing_list = []
-        self._vswing = False
-        self._hswing = False
+        self._vane_vertical = None
+        self._vane_horizontal = None
         self._power = False
         self._current_operation = STATE_UNKNOWN
-        self._has_swing_control = self._controller.has_swing_control
+        self._has_vertical_vane = controller.has_vertical_vane
+        self._has_horizontal_vane = controller.has_horizontal_vane
 
         # Setup fan list
         self._fan_list = [x.title() for x in self._controller.fan_speed_list]
@@ -173,16 +185,17 @@ class IntesisBoxAC(ClimateEntity):
         if len(self._fan_list) > 0:
             self._base_features |= ClimateEntityFeature.FAN_MODE
 
-        # Setup swing control
-        if self._has_swing_control:
+        # Setup swing control. Home Assistant models the two vane axes
+        # separately, so each is offered only if the unit actually has it -
+        # many units report VANEUD and no VANELR at all.
+        self._swing_list = [vane_to_ha(v) for v in self._controller.vane_vertical_list]
+        self._swing_horizontal_list = [
+            vane_to_ha(v) for v in self._controller.vane_horizontal_list
+        ]
+        if self._has_vertical_vane:
             self._base_features |= ClimateEntityFeature.SWING_MODE
-            self._swing_list = [SWING_LIST_STOP]
-            if SWING_ON in self._controller.vane_horizontal_list:
-                self._swing_list.append(SWING_LIST_HORIZONTAL)
-            if SWING_ON in self._controller.vane_vertical_list:
-                self._swing_list.append(SWING_LIST_VERTICAL)
-            if len(self._swing_list) > 2:
-                self._swing_list.append(SWING_LIST_BOTH)
+        if self._has_horizontal_vane:
+            self._base_features |= ClimateEntityFeature.SWING_HORIZONTAL_MODE
 
         _LOGGER.debug("Finished setting up climate entity!")
         self._controller.add_update_callback(self.update_callback)
@@ -217,9 +230,10 @@ class IntesisBoxAC(ClimateEntity):
     def extra_state_attributes(self):
         """Return the device specific state attributes."""
         attrs = {}
-        if self._has_swing_control:
-            attrs["vertical_swing"] = self._vswing
-            attrs["horizontal_swing"] = self._hswing
+        if self._has_vertical_vane:
+            attrs["vertical_swing"] = self._vane_vertical
+        if self._has_horizontal_vane:
+            attrs["horizontal_swing"] = self._vane_horizontal
 
         if self._controller.is_connected:
             attrs["ha_update_type"] = "push"
@@ -270,19 +284,14 @@ class IntesisBoxAC(ClimateEntity):
         await self._controller.async_set_fan_speed(target.upper())
 
     async def async_set_swing_mode(self, swing_mode):
-        """Set the vertical vane."""
-        if swing_mode == SWING_LIST_BOTH:
-            await self._controller.async_set_vertical_vane(SWING_ON)
-            await self._controller.async_set_horizontal_vane(SWING_ON)
-        elif swing_mode == SWING_LIST_STOP:
-            await self._controller.async_set_vertical_vane(SWING_STOP)
-            await self._controller.async_set_horizontal_vane(SWING_STOP)
-        elif swing_mode == SWING_LIST_HORIZONTAL:
-            await self._controller.async_set_vertical_vane(SWING_STOP)
-            await self._controller.async_set_horizontal_vane(SWING_ON)
-        elif swing_mode == SWING_LIST_VERTICAL:
-            await self._controller.async_set_vertical_vane(SWING_ON)
-            await self._controller.async_set_horizontal_vane(SWING_STOP)
+        """Set the up/down vane position."""
+        await self._controller.async_set_vertical_vane(vane_to_device(swing_mode))
+
+    async def async_set_swing_horizontal_mode(self, swing_horizontal_mode):
+        """Set the left/right vane position."""
+        await self._controller.async_set_horizontal_vane(
+            vane_to_device(swing_horizontal_mode)
+        )
 
     async def async_update(self):
         """Copy values from controller dictionary to climate device."""
@@ -301,11 +310,9 @@ class IntesisBoxAC(ClimateEntity):
         ib_mode = self._controller.mode
         self._current_operation = MAP_OPERATION_MODE_TO_HA.get(ib_mode, STATE_UNKNOWN)
 
-        # Swing mode
-        # Climate module only supports one swing setting.
-        if self._has_swing_control:
-            self._vswing = self._controller.vertical_swing == SWING_ON
-            self._hswing = self._controller.horizontal_swing == SWING_ON
+        # Vane positions, one per axis.
+        self._vane_vertical = vane_to_ha(self._controller.vertical_swing)
+        self._vane_horizontal = vane_to_ha(self._controller.horizontal_swing)
 
         # Track connection lost/restored.
         if self._connected != self._controller.is_connected:
@@ -367,15 +374,13 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def swing_mode(self):
-        """Return current swing mode."""
-        if self._vswing and self._hswing:
-            return SWING_LIST_BOTH
-        elif self._vswing:
-            return SWING_LIST_VERTICAL
-        elif self._hswing:
-            return SWING_LIST_HORIZONTAL
-        else:
-            return SWING_LIST_STOP
+        """Return the current up/down vane position."""
+        return self._vane_vertical
+
+    @property
+    def swing_horizontal_mode(self):
+        """Return the current left/right vane position."""
+        return self._vane_horizontal
 
     @property
     def fan_modes(self):
@@ -384,8 +389,13 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def swing_modes(self):
-        """List of available swing positions."""
+        """Available up/down vane positions."""
         return self._swing_list
+
+    @property
+    def swing_horizontal_modes(self):
+        """Available left/right vane positions."""
+        return self._swing_horizontal_list
 
     @property
     def assumed_state(self) -> bool:
