@@ -1,7 +1,7 @@
 {
   "domain": "intesisbox",
   "name": "IntesisBox",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "documentation": "https://github.com/jackmcintyre/hass-intesisbox",
   "issue_tracker": "https://github.com/jackmcintyre/hass-intesisbox/issues",
   "dependencies": [],
