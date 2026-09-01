@@ -35,17 +35,55 @@ FUNCTION_ERRCODE = "ERRCODE"
 
 NULL_VALUES = ["-32768", "32768"]
 
+# The WMP spec (v1.11 §Overview) states the device closes the TCP connection
+# after 1 minute without traffic, and recommends a keepalive every 30-60s.
+KEEPALIVE_INTERVAL = 45
+# Full status refresh. Changes arrive spontaneously as CHN messages, so this is
+# only a backstop against missed pushes.
+STATUS_POLL_INTERVAL = 60 * 5
+# Ambient temperature is pushed on change, but poll it as well so a missed push
+# cannot leave the reported temperature stale indefinitely.
+AMBTEMP_POLL_INTERVAL = 60
+
+# The spec (§Considerations iii) requires more than 1 second between opening and
+# closing TCP sockets. Backoff starts there and grows to avoid hammering a device
+# that is powered off.
+RECONNECT_MIN_DELAY = 1.5
+RECONNECT_MAX_DELAY = 60
+
+# Gap between successive commands. The spec (§FAQs) says commands cannot be
+# batched, but imposes no minimum spacing - the 1 second rule applies to socket
+# open/close cycles, not to commands on an established connection.
+COMMAND_INTERVAL = 0.2
+
+# How long to wait for the device to confirm a mode change before giving up.
+CONFIRM_TIMEOUT = 10
+
+# Commands sent on connect. The device is not considered ready until every one
+# of these has been answered.
+INIT_COMMANDS = [
+    "ID",
+    f"LIMITS:{FUNCTION_SETPOINT}",
+    f"LIMITS:{FUNCTION_FANSP}",
+    f"LIMITS:{FUNCTION_MODE}",
+    f"LIMITS:{FUNCTION_VANEUD}",
+    f"LIMITS:{FUNCTION_VANELR}",
+]
+
 background_tasks = set()
 
 
 def clean_background_task(task):
-    """Handle background task completion."""
+    """Handle background task completion, logging any unexpected failure."""
     background_tasks.discard(task)
-    _ = task.result()  # to propagate exceptions
+    if task.cancelled():
+        return
+    if exc := task.exception():
+        _LOGGER.error("Background task failed: %r", exc)
 
 
 def ensure_background_task(coro, loop):
-    """Ensure background task is running."""
+    """Schedule a coroutine on the given loop and keep a reference to it."""
     task = asyncio.ensure_future(coro, loop=loop)
     background_tasks.add(task)
     task.add_done_callback(clean_background_task)
@@ -62,267 +100,529 @@ class IntesisBox(asyncio.Protocol):
         self._mac = None
         self._device: dict[str, str] = {}
         self._connectionStatus = API_DISCONNECTED
-        self._transport: asyncio.BaseTransport | None = None
+        self._transport: asyncio.Transport | None = None
         self._updateCallbacks: list[Callable[[], None]] = []
         self._errorCallbacks: list[Callable[[str], None]] = []
         self._errorMessage: str | None = None
         self._controllerType = None
         self._model: str | None = None
         self._firmversion: str | None = None
-        self._rssi: int | None = None
+        self._rssi: str | None = None
         self._eventLoop = loop
+
+        # Receive buffer. TCP is a byte stream, so a single data_received() may
+        # carry a partial line, several lines, or both.
+        self._buffer = b""
+
+        # Outbound commands are serialised through a queue drained by a single
+        # writer task, so every write happens on the event loop thread and no
+        # two callers can interleave.
+        self._write_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        # Set once ID and every LIMITS reply have been received.
+        self._ready = asyncio.Event()
+        self._pending_init: set[str] = set()
+
+        # Waiters for a specific function reaching a specific value, used to
+        # confirm a change instead of polling for it.
+        self._change_waiters: list[tuple[str, str, asyncio.Future]] = []
+
+        # Owned tasks, cancelled and replaced on every (re)connect.
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._stopped = False
 
         # Limits
         self._operation_list: list[str] = []
         self._fan_speed_list: list[str] = []
         self._vertical_vane_list: list[str] = []
         self._horizontal_vane_list: list[str] = []
-        self._setpoint_minimum: int | None = None
-        self._setpoint_maximum: int | None = None
+        self._setpoint_minimum: float | None = None
+        self._setpoint_maximum: float | None = None
+
+    # ------------------------------------------------------------------
+    # Task ownership
+    # ------------------------------------------------------------------
+
+    def _start_task(self, name: str, coro) -> None:
+        """Start a named task, cancelling any previous instance first.
+
+        Without this, a reconnect that lands inside a poller's sleep leaves the
+        old task alive alongside the new one and the traffic doubles each time.
+        """
+        self._cancel_task(name)
+        self._tasks[name] = ensure_background_task(coro, self._eventLoop)
+
+    def _cancel_task(self, name: str) -> None:
+        """Cancel a named task if it is running."""
+        task = self._tasks.pop(name, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _cancel_all_tasks(self) -> None:
+        """Cancel every owned task."""
+        for name in list(self._tasks):
+            self._cancel_task(name)
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
 
     def connection_made(self, transport: asyncio.BaseTransport):
         """Asyncio callback for a successful connection."""
-        _LOGGER.debug("Connected to IntesisBox")
-        self._transport = transport
-        ensure_background_task(self.query_initial_state(), self._eventLoop)
+        _LOGGER.debug("Connected to IntesisBox %s:%s", self._ip, self._port)
+        self._transport = transport  # type: ignore[assignment]
+        self._buffer = b""
+        self._connectionStatus = API_CONNECTING
+        self._ready.clear()
+        self._pending_init = set(INIT_COMMANDS)
 
-    async def keep_alive(self):
-        """Send a keepalive command to reset it's watchdog timer."""
-        while self.is_connected:
-            _LOGGER.debug("Sending keepalive")
-            self._write("PING")
-            await asyncio.sleep(45)
-        else:
-            _LOGGER.debug("Not connected, skipping keepalive")
+        # Drain anything queued while disconnected; it refers to a dead socket.
+        while not self._write_queue.empty():
+            self._write_queue.get_nowait()
 
-    async def poll_ambtemp(self):
-        """Retrieve Ambient Temperature to prevent integration timeouts."""
-        while self.is_connected:
-            _LOGGER.debug("Sending AMBTEMP")
-            self._write("GET,1:AMBTEMP")
-            await asyncio.sleep(10)
+        self._start_task("writer", self._writer())
+        self._start_task("init", self.query_initial_state())
+
+    def connection_lost(self, exc):
+        """Asyncio callback for a lost TCP connection."""
+        if exc:
+            _LOGGER.warning("Connection to IntesisBox %s lost: %r", self._ip, exc)
         else:
-            _LOGGER.debug("Not connected, skipping Ambient Temp Request")
+            _LOGGER.info("IntesisBox %s closed the connection", self._ip)
+
+        self._connectionStatus = API_DISCONNECTED
+        self._transport = None
+        self._ready.clear()
+        self._cancel_all_tasks()
+        self._fail_change_waiters(ConnectionResetError("Connection lost"))
+        self._send_update_callback()
+
+        if not self._stopped:
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Start the reconnect loop if it is not already running."""
+        task = self._tasks.get("reconnect")
+        if task and not task.done():
+            return
+        self._tasks["reconnect"] = ensure_background_task(
+            self._reconnect_loop(), self._eventLoop
+        )
+
+    async def _reconnect_loop(self) -> None:
+        """Reconnect with exponential backoff until the device answers."""
+        delay = RECONNECT_MIN_DELAY
+        while not self._stopped and not self.is_connected:
+            await asyncio.sleep(delay)
+            if self._stopped:
+                return
+            try:
+                await self._open_connection()
+            except OSError as exc:
+                _LOGGER.debug("Reconnect to %s failed: %r", self._ip, exc)
+                delay = min(delay * 2, RECONNECT_MAX_DELAY)
+                continue
+            # Wait for the handshake to complete before declaring victory; a
+            # socket that opens but never answers ID is not a usable device.
+            try:
+                async with asyncio.timeout(CONFIRM_TIMEOUT):
+                    await self._ready.wait()
+            except TimeoutError:
+                _LOGGER.debug("IntesisBox %s connected but did not answer", self._ip)
+                self._close_transport()
+                delay = min(delay * 2, RECONNECT_MAX_DELAY)
+                continue
+            _LOGGER.info("Reconnected to IntesisBox %s", self._ip)
+            return
+
+    async def _open_connection(self) -> None:
+        """Open the TCP connection. Raises OSError on failure."""
+        if not self._ip or not self._port:
+            raise OSError("Missing IP address or port")
+        self._connectionStatus = API_CONNECTING
+        _LOGGER.debug("Opening connection to IntesisBox %s:%s", self._ip, self._port)
+        try:
+            await self._eventLoop.create_connection(lambda: self, self._ip, self._port)
+        except OSError:
+            # Reset the status, otherwise every later attempt sees CONNECTING
+            # and refuses to try again.
+            self._connectionStatus = API_DISCONNECTED
+            raise
+
+    async def async_connect(self, timeout: float = 30) -> bool:
+        """Connect and wait until the device has reported ID and all limits.
+
+        Returns True once ready, False if the device could not be reached or
+        did not finish the handshake within the timeout.
+        """
+        self._stopped = False
+        if self.is_connected:
+            return True
+        try:
+            await self._open_connection()
+        except OSError as exc:
+            _LOGGER.debug("Connection to %s failed: %r", self._ip, exc)
+            self._schedule_reconnect()
+            return False
+        try:
+            async with asyncio.timeout(timeout):
+                await self._ready.wait()
+        except TimeoutError:
+            _LOGGER.debug("IntesisBox %s did not complete handshake", self._ip)
+            self._close_transport()
+            self._schedule_reconnect()
+            return False
+        return True
+
+    def connect(self):
+        """Connect to the device, scheduling the work on the event loop."""
+        self._stopped = False
+        if self.is_connected:
+            return
+        ensure_background_task(self.async_connect(), self._eventLoop)
+
+    def _close_transport(self) -> None:
+        """Close the transport if there is one."""
+        if self._transport is not None and not self._transport.is_closing():
+            self._transport.close()
+
+    def stop(self):
+        """Shut down connectivity with the device and cancel all tasks."""
+        self._stopped = True
+        self._connectionStatus = API_DISCONNECTED
+        self._ready.clear()
+        self._cancel_all_tasks()
+        self._fail_change_waiters(ConnectionResetError("Stopped"))
+        self._close_transport()
+        self._transport = None
+
+    # ------------------------------------------------------------------
+    # Outbound commands
+    # ------------------------------------------------------------------
+
+    async def _writer(self) -> None:
+        """Drain the write queue, one command at a time, on the event loop."""
+        while True:
+            cmd = await self._write_queue.get()
+            transport = self._transport
+            if transport is None or transport.is_closing():
+                _LOGGER.debug("Dropping %r, transport is gone", cmd)
+                continue
+            try:
+                transport.write(f"{cmd}\r".encode("ascii"))
+            except Exception as exc:  # noqa: BLE001 - surface, do not crash writer
+                _LOGGER.error("Failed to send %r: %r", cmd, exc)
+                continue
+            _LOGGER.debug("Data sent: %r", cmd)
+            await asyncio.sleep(COMMAND_INTERVAL)
+
+    async def _send(self, cmd: str) -> None:
+        """Queue a command for transmission."""
+        await self._write_queue.put(cmd)
+
+    def send_threadsafe(self, cmd: str) -> None:
+        """Queue a command from outside the event loop thread."""
+        self._eventLoop.call_soon_threadsafe(self._write_queue.put_nowait, cmd)
 
     async def query_initial_state(self):
-        """Fetch configuration from the device upon connection."""
-        cmds = [
-            "ID",
-            "LIMITS:SETPTEMP",
-            "LIMITS:FANSP",
-            "LIMITS:MODE",
-            "LIMITS:VANEUD",
-            "LIMITS:VANELR",
-        ]
-        for cmd in cmds:
-            self._write(cmd)
-            await asyncio.sleep(1)
+        """Fetch identification and limits from the device upon connection."""
+        for cmd in INIT_COMMANDS:
+            await self._send(cmd)
 
-    def _write(self, cmd):
-        self._transport.write(f"{cmd}\r".encode("ascii"))
-        _LOGGER.debug(f"Data sent: {cmd!r}")
+    async def keep_alive(self):
+        """Send PING periodically to reset the device's watchdog timer."""
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            _LOGGER.debug("Sending keepalive")
+            await self._send("PING")
 
-    async def _writeasync(self, cmd):
-        """Async write to slow down commands and await response from units."""
-        self._transport.write(f"{cmd}\r".encode("ascii"))
-        _LOGGER.debug(f"Data sent: {cmd!r}")
-        await asyncio.sleep(1)
+    async def poll_status(self):
+        """Periodically request a full status refresh."""
+        while True:
+            await self._send("GET,1:*")
+            await asyncio.sleep(STATUS_POLL_INTERVAL)
 
-    def data_received(self, data):
-        """Asyncio callback when data is received on the socket."""
-        linesReceived = data.decode("ascii").splitlines()
+    async def poll_ambtemp(self):
+        """Periodically refresh the ambient temperature."""
+        while True:
+            await asyncio.sleep(AMBTEMP_POLL_INTERVAL)
+            await self._send(f"GET,1:{FUNCTION_AMBTEMP}")
+
+    # ------------------------------------------------------------------
+    # Inbound data
+    # ------------------------------------------------------------------
+
+    def data_received(self, data: bytes):
+        """Asyncio callback when data is received on the socket.
+
+        TCP is a byte stream: a chunk may end mid-line, so the tail is buffered
+        until the rest of the line arrives.
+        """
+        self._buffer += data
+        # Per the spec (§2) lines end with \r, \n or \r\n.
+        self._buffer = self._buffer.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        *lines, self._buffer = self._buffer.split(b"\n")
+
         statusChanged = False
-
-        for line in linesReceived:
-            _LOGGER.debug(f"Data received: {line!r}")
-            cmdList = line.split(":", 1)
-            cmd = cmdList[0]
-            args = None
-            if len(cmdList) > 1:
-                args = cmdList[1]
-                if cmd == "ID":
-                    self._parse_id_received(args)
-                    self._connectionStatus = API_AUTHENTICATED
-                    ensure_background_task(self.poll_status(), self._eventLoop)
-                    ensure_background_task(self.poll_ambtemp(), self._eventLoop)
-                elif cmd == "CHN,1":
-                    self._parse_change_received(args)
-                    statusChanged = True
-                elif cmd == "LIMITS":
-                    self._parse_limits_received(args)
-                    statusChanged = True
+        for raw in lines:
+            if not raw.strip():
+                continue
+            try:
+                line = raw.decode("ascii").strip()
+            except UnicodeDecodeError:
+                _LOGGER.warning("Discarding non-ASCII data: %r", raw)
+                continue
+            try:
+                statusChanged |= self._process_line(line)
+            except Exception:  # noqa: BLE001 - one bad line must not kill the socket
+                _LOGGER.exception("Failed to process line: %r", line)
 
         if statusChanged:
             self._send_update_callback()
 
-    def _parse_id_received(self, args):
-        # ID:Model,MAC,IP,Protocol,Version,RSSI
-        info = args.split(",")
-        if len(info) >= 6:
-            self._model = info[0]
-            self._mac = info[1]
-            self._firmversion = info[4]
-            self._rssi = info[5]
+    def _process_line(self, line: str) -> bool:
+        """Handle one complete line. Returns True if state changed."""
+        _LOGGER.debug("Data received: %r", line)
 
-            _LOGGER.debug(
-                "Updated info:",
-                f"model:{self._model}",
-                f"mac:{self._mac}",
-                f"version:{self._firmversion}",
-                f"rssi:{self._rssi}",
-            )
+        if line == "ACK":
+            return False
+        if line == "ERR":
+            # The spec (§FAQs) returns a bare ERR for an invalid value or a
+            # write to a read-only function, with no indication of which
+            # command failed.
+            _LOGGER.warning("IntesisBox %s rejected a command", self._ip)
+            self._send_error_callback("Device rejected the command")
+            return False
+
+        cmdList = line.split(":", 1)
+        if len(cmdList) < 2:
+            return False
+        cmd, args = cmdList[0], cmdList[1]
+
+        if cmd == "ID":
+            self._parse_id_received(args)
+            self._mark_init_complete("ID")
+            return True
+        if cmd == "CHN,1":
+            self._parse_change_received(args)
+            return True
+        if cmd == "LIMITS":
+            function = self._parse_limits_received(args)
+            if function:
+                self._mark_init_complete(f"LIMITS:{function}")
+            return True
+        return False
+
+    def _mark_init_complete(self, cmd: str) -> None:
+        """Record an answered init command and signal readiness once complete."""
+        if not self._pending_init:
+            # Not mid-handshake; this is an unsolicited or late reply.
+            return
+        self._pending_init.discard(cmd)
+        if self._pending_init or self._ready.is_set():
+            return
+
+        self._connectionStatus = API_AUTHENTICATED
+        self._ready.set()
+        _LOGGER.debug("IntesisBox %s ready", self._ip)
+
+        # Start the periodic tasks only once the handshake is done, and only
+        # ever one of each.
+        self._start_task("keepalive", self.keep_alive())
+        self._start_task("poll_status", self.poll_status())
+        self._start_task("poll_ambtemp", self.poll_ambtemp())
+
+    def _parse_id_received(self, args):
+        """Parse the ID reply.
+
+        Gen 1: Model,MAC,IP,Protocol,Version,RSSI[,Name,Security,Generation]
+        V6:    Model,MAC,IP,Version,RSSI,GwName,SecurityLevel,Generation
+        The Protocol field is absent on V6, shifting every later field left.
+        """
+        info = [field.strip() for field in args.split(",")]
+        if len(info) < 5:
+            _LOGGER.warning("Unexpected ID reply: %r", args)
+            return
+
+        # V6 omits Protocol; gen 1 always reports it as a non-numeric token
+        # ("ASCII") in position 3.
+        is_v6 = len(info) >= 8 and info[3].upper() != "ASCII"
+        offset = 3 if is_v6 else 4
+
+        self._model = info[0]
+        self._mac = info[1]
+        self._firmversion = info[offset]
+        self._rssi = info[offset + 1] if len(info) > offset + 1 else None
+        self._controllerType = "V6" if is_v6 else "V1"
+
+        _LOGGER.debug(
+            "Updated info: model=%s mac=%s version=%s rssi=%s type=%s",
+            self._model,
+            self._mac,
+            self._firmversion,
+            self._rssi,
+            self._controllerType,
+        )
 
     def _parse_change_received(self, args):
-        function = args.split(",")[0]
-        value = args.split(",")[1]
+        """Parse a CHN status change message."""
+        parts = args.split(",", 1)
+        if len(parts) != 2:
+            _LOGGER.warning("Malformed change message: %r", args)
+            return
+        function, value = parts[0].strip(), parts[1].strip()
         if value in NULL_VALUES:
             value = None
         self._device[function] = value
 
-        _LOGGER.debug(f"Updated state: {self._device!r}")
+        _LOGGER.debug("Updated state: %r", self._device)
+        self._resolve_change_waiters(function, value)
 
-    def _parse_limits_received(self, args):
+    def _parse_limits_received(self, args) -> str | None:
+        """Parse a LIMITS reply. Returns the function name, or None."""
         split_args = args.split(",", 1)
+        if len(split_args) != 2:
+            _LOGGER.warning("Malformed limits message: %r", args)
+            return None
 
-        if len(split_args) == 2:
-            function = split_args[0]
-            values = split_args[1][1:-1].split(",")
+        function = split_args[0].strip()
+        values = [v.strip() for v in split_args[1].strip().strip("[]").split(",")]
 
-            if function == FUNCTION_SETPOINT and len(values) == 2:
+        if function == FUNCTION_SETPOINT and len(values) == 2:
+            try:
                 self._setpoint_minimum = int(values[0]) / 10
                 self._setpoint_maximum = int(values[1]) / 10
-            elif function == FUNCTION_FANSP:
-                self._fan_speed_list = values
-            elif function == FUNCTION_MODE:
-                self._operation_list = values
-            elif function == FUNCTION_VANEUD:
-                self._vertical_vane_list = values
-            elif function == FUNCTION_VANELR:
-                self._horizontal_vane_list = values
-
-            _LOGGER.debug(
-                "Updated limits: ",
-                f"{self._setpoint_minimum=}",
-                f"{self._setpoint_maximum=}",
-                f"{self._fan_speed_list=}",
-                f"{self._operation_list=}",
-                f"{self._vertical_vane_list=}",
-                f"{self._horizontal_vane_list=}",
-            )
-        return
-
-    def connection_lost(self, exc):
-        """Asyncio callback for a lost TCP connection."""
-        self._connectionStatus = API_DISCONNECTED
-        _LOGGER.info("The server closed the connection")
-        self._send_update_callback()
-
-    def connect(self):
-        """Public method for connecting to IntesisHome API."""
-        if self._connectionStatus == API_DISCONNECTED:
-            self._connectionStatus = API_CONNECTING
-            try:
-                # Must poll to get the authentication token
-                if self._ip and self._port:
-                    # Create asyncio socket
-                    coro = self._eventLoop.create_connection(
-                        lambda: self, self._ip, self._port
-                    )
-                    _LOGGER.debug(
-                        "Opening connection to IntesisBox %s:%s", self._ip, self._port
-                    )
-                    ensure_background_task(coro, self._eventLoop)
-                else:
-                    _LOGGER.debug("Missing IP address or port.")
-                    self._connectionStatus = API_DISCONNECTED
-
-            except Exception as e:
-                _LOGGER.error("%s Exception. %s / %s", type(e), repr(e.args), e)
-                self._connectionStatus = API_DISCONNECTED
-        elif self._connectionStatus == API_CONNECTING:
-            _LOGGER.debug("connect() called but already connecting")
-            if self._transport.is_closing():
-                _LOGGER.debug(
-                    "Socket is closing while trying to connect. Force reconnection"
-                )
-                self._connectionStatus = API_DISCONNECTED
-                self._transport.close()
-                self._send_update_callback()
-
-    def stop(self):
-        """Public method for shutting down connectivity with the envisalink."""
-        self._connectionStatus = API_DISCONNECTED
-        self._transport.close()
-
-    async def poll_status(self, sendcallback=False):
-        """Periodically poll for updates since the controllers don't always update reliably."""
-        while self.is_connected:
-            _LOGGER.debug("Polling for update")
-            self._write("GET,1:*")
-            await asyncio.sleep(60 * 5)  # 5 minutes
+            except ValueError:
+                _LOGGER.warning("Non-numeric setpoint limits: %r", values)
+                return None
+        elif function == FUNCTION_FANSP:
+            self._fan_speed_list = values
+        elif function == FUNCTION_MODE:
+            self._operation_list = values
+        elif function == FUNCTION_VANEUD:
+            self._vertical_vane_list = values
+        elif function == FUNCTION_VANELR:
+            self._horizontal_vane_list = values
         else:
-            _LOGGER.debug("Not connected, skipping poll_status()")
+            return None
 
-    def set_temperature(self, setpoint):
-        """Public method for setting the temperature."""
-        set_temp = int(setpoint * 10)
-        self._set_value(FUNCTION_SETPOINT, set_temp)
+        _LOGGER.debug(
+            "Updated limits: setpoint=%s-%s fan=%s mode=%s vaneud=%s vanelr=%s",
+            self._setpoint_minimum,
+            self._setpoint_maximum,
+            self._fan_speed_list,
+            self._operation_list,
+            self._vertical_vane_list,
+            self._horizontal_vane_list,
+        )
+        return function
 
-    def set_fan_speed(self, fan_speed):
-        """Public method to set the fan speed."""
-        self._set_value(FUNCTION_FANSP, fan_speed)
+    # ------------------------------------------------------------------
+    # Change confirmation
+    # ------------------------------------------------------------------
 
-    def set_vertical_vane(self, vane: str):
-        """Public method to set the vertical vane."""
-        self._set_value(FUNCTION_VANEUD, vane)
+    def _resolve_change_waiters(self, function: str, value: str | None) -> None:
+        """Wake anyone waiting for this function to reach this value."""
+        for waiter in list(self._change_waiters):
+            wanted_function, wanted_value, future = waiter
+            if wanted_function == function and wanted_value == value:
+                self._change_waiters.remove(waiter)
+                if not future.done():
+                    future.set_result(True)
 
-    def set_horizontal_vane(self, vane: str):
-        """Public method to set the horizontal vane."""
-        self._set_value(FUNCTION_VANELR, vane)
+    def _fail_change_waiters(self, exc: Exception) -> None:
+        """Fail every outstanding waiter, e.g. because the socket dropped."""
+        for _, _, future in self._change_waiters:
+            if not future.done():
+                future.set_exception(exc)
+        self._change_waiters.clear()
 
-    def _set_value(self, uid: str, value: str | int) -> None:
-        """Change a setting on the thermostat."""
+    async def _wait_for_value(
+        self, function: str, value: str, timeout: float = CONFIRM_TIMEOUT
+    ) -> bool:
+        """Wait for a function to report a value, using the device's own push.
+
+        Returns True on confirmation, False on timeout. This replaces polling
+        the device repeatedly; the WMP spec (§CHN) guarantees a spontaneous
+        change message whenever a value actually changes.
+        """
+        if self._device.get(function) == value:
+            return True
+        future: asyncio.Future = self._eventLoop.create_future()
+        waiter = (function, value, future)
+        self._change_waiters.append(waiter)
         try:
-            asyncio.run(self._writeasync(f"SET,1:{uid},{value}"))
-        except Exception as e:
-            _LOGGER.error("%s Exception. %s / %s", type(e), e.args, e)
+            async with asyncio.timeout(timeout):
+                await future
+        except TimeoutError:
+            if waiter in self._change_waiters:
+                self._change_waiters.remove(waiter)
+            return False
+        except ConnectionResetError:
+            return False
+        return True
 
-    def set_mode(self, mode):
-        """Send mode and confirm change before turning on."""
-        """Some units return responses out of order"""
-        _LOGGER.debug(f"Setting MODE to {mode}.")
-        if mode in MODES:
-            self._set_value(FUNCTION_MODE, mode)
-        if not self.is_on:
-            """Check to ensure in correct mode before turning on"""
-            retry = 30
-            while self.mode != mode and retry > 0:
-                _LOGGER.debug(
-                    f"Waiting for MODE to return {mode}, currently {str(self.mode)}"
-                )
-                _LOGGER.debug(f"Retry attempt = {retry}")
-                asyncio.run(self._writeasync("GET,1:MODE"))
-                retry -= 1
-            else:
-                if retry != 0:
-                    _LOGGER.debug(
-                        f"MODE confirmed now {str(self.mode)}, proceed to Power On"
-                    )
-                    self.set_power_on()
-                else:
-                    _LOGGER.error("Cannot set Intesisbox mode giving up...")
+    # ------------------------------------------------------------------
+    # Public control surface
+    # ------------------------------------------------------------------
 
-    def set_mode_dry(self):
-        """Public method to set device to dry asynchronously."""
-        self._set_value(FUNCTION_MODE, MODE_DRY)
+    async def async_set_temperature(self, setpoint: float) -> None:
+        """Set the target temperature."""
+        await self._set_value(FUNCTION_SETPOINT, int(setpoint * 10))
 
-    def set_power_off(self):
-        """Public method to turn off the device asynchronously."""
-        self._set_value(FUNCTION_ONOFF, POWER_OFF)
+    async def async_set_fan_speed(self, fan_speed: str) -> None:
+        """Set the fan speed."""
+        await self._set_value(FUNCTION_FANSP, fan_speed)
 
-    def set_power_on(self):
-        """Public method to turn on the device asynchronously."""
-        self._set_value(FUNCTION_ONOFF, POWER_ON)
+    async def async_set_vertical_vane(self, vane: str) -> None:
+        """Set the vertical vane."""
+        await self._set_value(FUNCTION_VANEUD, vane)
+
+    async def async_set_horizontal_vane(self, vane: str) -> None:
+        """Set the horizontal vane."""
+        await self._set_value(FUNCTION_VANELR, vane)
+
+    async def async_set_power_off(self) -> None:
+        """Turn the device off."""
+        await self._set_value(FUNCTION_ONOFF, POWER_OFF)
+
+    async def async_set_power_on(self) -> None:
+        """Turn the device on."""
+        await self._set_value(FUNCTION_ONOFF, POWER_ON)
+
+    async def async_set_mode(self, mode: str) -> None:
+        """Set the mode, confirming the change before turning the unit on.
+
+        Some units apply ONOFF and MODE out of order, so when the unit is off
+        we wait for the device to confirm the new mode before powering on.
+        """
+        if mode not in MODES:
+            _LOGGER.warning("Ignoring unsupported mode %r", mode)
+            return
+
+        _LOGGER.debug("Setting MODE to %s", mode)
+        await self._set_value(FUNCTION_MODE, mode)
+
+        if self.is_on:
+            return
+
+        if await self._wait_for_value(FUNCTION_MODE, mode):
+            _LOGGER.debug("MODE confirmed as %s, powering on", mode)
+            await self.async_set_power_on()
+        else:
+            _LOGGER.error(
+                "IntesisBox %s did not confirm mode %s, not powering on",
+                self._ip,
+                mode,
+            )
+
+    async def _set_value(self, uid: str, value: str | int) -> None:
+        """Change a setting on the thermostat."""
+        await self._send(f"SET,1:{uid},{value}")
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
     def operation_list(self) -> list[str]:
@@ -366,7 +666,7 @@ class IntesisBox(asyncio.Protocol):
 
     @property
     def firmware_version(self) -> str | None:
-        """Firmware versioon of the IntesisBox."""
+        """Firmware version of the IntesisBox."""
         return self._firmversion
 
     @property
@@ -402,7 +702,7 @@ class IntesisBox(asyncio.Protocol):
         return self._setpoint_minimum
 
     @property
-    def rssi(self) -> int | None:
+    def rssi(self) -> str | None:
         """Wireless signal strength of the IntesisBox."""
         return self._rssi
 
@@ -416,6 +716,30 @@ class IntesisBox(asyncio.Protocol):
         """Current horizontal vane setting."""
         return self._device.get(FUNCTION_VANELR)
 
+    @property
+    def is_connected(self) -> bool:
+        """Returns true if the device is connected and has reported its state."""
+        return self._connectionStatus == API_AUTHENTICATED
+
+    @property
+    def is_initialized(self) -> bool:
+        """Returns true once ID and all limits have been received."""
+        return self._ready.is_set()
+
+    @property
+    def error_message(self) -> str | None:
+        """Returns the last error message, or None if there were no errors."""
+        return self._errorMessage
+
+    @property
+    def is_disconnected(self) -> bool:
+        """Returns true when the TCP connection is disconnected and idle."""
+        return self._connectionStatus == API_DISCONNECTED
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+
     def _send_update_callback(self):
         """Notify all listeners that state of the thermostat has changed."""
         if not self._updateCallbacks:
@@ -428,26 +752,11 @@ class IntesisBox(asyncio.Protocol):
         """Notify all listeners that an error has occurred."""
         self._errorMessage = message
 
-        if self._errorCallbacks == []:
+        if not self._errorCallbacks:
             _LOGGER.debug("Error callback has not been set by client.")
 
         for callback in self._errorCallbacks:
             callback(message)
-
-    @property
-    def is_connected(self) -> bool:
-        """Returns true if the TCP connection is established."""
-        return self._connectionStatus == API_AUTHENTICATED
-
-    @property
-    def error_message(self) -> str | None:
-        """Returns the last error message, or None if there were no errors."""
-        return self._errorMessage
-
-    @property
-    def is_disconnected(self) -> bool:
-        """Returns true when the TCP connection is disconnected and idle."""
-        return self._connectionStatus == API_DISCONNECTED
 
     def add_update_callback(self, method):
         """Public method to add a callback subscriber."""
