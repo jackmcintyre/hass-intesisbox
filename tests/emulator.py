@@ -9,6 +9,7 @@ the connection.
 from __future__ import annotations
 
 import asyncio
+import re
 
 DEFAULT_STATE = {
     "MODE": "AUTO",
@@ -100,11 +101,19 @@ class Emulator(asyncio.Protocol):
             self.transport.write(data)
 
     def data_received(self, data: bytes) -> None:
-        """Reassemble lines and dispatch them."""
+        """Reassemble lines and dispatch them.
+
+        Deliberately framed by a different mechanism than the client's
+        data_received: a bug copied into both sides would make the client's
+        torn-frame handling look correct when it is not.
+        """
         self.buffer += data
-        self.buffer = self.buffer.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-        *lines, self.buffer = self.buffer.split(b"\n")
-        for raw in lines:
+        while True:
+            match = re.search(rb"[\r\n]", self.buffer)
+            if match is None:
+                break
+            raw = self.buffer[: match.start()]
+            self.buffer = self.buffer[match.end() :]
             line = raw.decode("ascii").strip()
             if line:
                 self.handle(line)

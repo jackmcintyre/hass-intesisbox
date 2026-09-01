@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import logging
 
-import pytest
-
 from custom_components.intesisbox.climate import IntesisBoxAC
 from homeassistant.components.climate import ClimateEntityFeature, HVACMode
 from homeassistant.const import ATTR_TEMPERATURE
@@ -74,20 +72,19 @@ class FakeController:
         self.calls: list[tuple[str, object]] = []
         self._update_callbacks = []
 
+        # Mirrors the real controller's learned read-only latch, so the
+        # entity-layer consequences of a refused vane write are testable.
+        self.vane_settable = {"VANEUD": True, "VANELR": True}
+
     @property
     def has_vertical_vane(self) -> bool:
         """Mirror the real controller's capability test."""
-        return len(self.vane_vertical_list) > 1
+        return len(self.vane_vertical_list) > 1 and self.vane_settable["VANEUD"]
 
     @property
     def has_horizontal_vane(self) -> bool:
         """Mirror the real controller's capability test."""
-        return len(self.vane_horizontal_list) > 1
-
-    @property
-    def has_swing_control(self) -> bool:
-        """True if either axis exists."""
-        return self.has_vertical_vane or self.has_horizontal_vane
+        return len(self.vane_horizontal_list) > 1 and self.vane_settable["VANELR"]
 
     def add_update_callback(self, method):
         """Record the entity's callback."""
@@ -247,13 +244,28 @@ def test_unknown_operation_mode_is_skipped(caplog):
     assert "WIBBLE" in caplog.text
 
 
-def test_no_usable_modes_raises_not_ready():
-    """If nothing maps, the platform should retry rather than half-load."""
-    from homeassistant.exceptions import PlatformNotReady
+def test_no_usable_modes_falls_back_to_the_standard_set(caplog):
+    """A device with no mappable modes degrades instead of failing setup.
 
+    The controller deliberately becomes ready without LIMITS replies, so a
+    permanently-empty mode list would otherwise retry setup forever against
+    a device that will never answer differently.
+    """
     controller = FakeController(operation_list=["WIBBLE"])
-    with pytest.raises(PlatformNotReady):
-        make_entity(controller)
+    with caplog.at_level(logging.WARNING):
+        entity = make_entity(controller)
+
+    assert HVACMode.OFF in entity.hvac_modes
+    assert HVACMode.HEAT in entity.hvac_modes
+    assert HVACMode.COOL in entity.hvac_modes
+
+
+def test_empty_fan_list_degrades_instead_of_raising():
+    """A device that ignores LIMITS:FANSP still gets an entity, minus fan."""
+    controller = FakeController(fan_speed_list=[])
+    entity = make_entity(controller)
+    assert not entity.supported_features & ClimateEntityFeature.FAN_MODE
+    assert entity.fan_mode is None
 
 
 # --------------------------------------------------------------------------
@@ -326,6 +338,45 @@ def test_current_vane_position_is_reported():
     entity = make_entity(controller)
     entity._vane_vertical = "3"
     assert entity.swing_mode == "3"
+
+
+def test_refused_vane_write_drops_the_feature_at_the_entity():
+    """The learned read-only latch must reach supported_features live."""
+    controller = FakeController(vertical_vane_list=["AUTO", "1", "2", "3", "SWING"])
+    entity = make_entity(controller)
+    assert entity.supported_features & ClimateEntityFeature.SWING_MODE
+    assert entity.swing_modes == ["auto", "1", "2", "3", "swing"]
+
+    controller.vane_settable["VANEUD"] = False
+
+    assert not entity.supported_features & ClimateEntityFeature.SWING_MODE
+    assert entity.swing_modes == []
+
+
+async def test_legacy_swing_vocabulary_maps_to_axis_writes():
+    """Pre-2.3 automations sending Both/Vertical/Horizontal must not ERR.
+
+    'Both' used to swing both axes from one selector; sent raw it becomes
+    SET,1:VANEUD,BOTH, the device rejects it, and the ERR latch would then
+    disable a working vane.
+    """
+    controller = FakeController(
+        vertical_vane_list=["AUTO", "1", "SWING"],
+        horizontal_vane_list=["AUTO", "1", "SWING"],
+    )
+    entity = make_entity(controller)
+
+    await entity.async_set_swing_mode("Both")
+    await entity.async_set_swing_mode("Vertical")
+    await entity.async_set_swing_mode("Horizontal")
+
+    assert controller.calls == [
+        ("vane_ud", "SWING"),
+        ("vane_lr", "SWING"),
+        ("vane_ud", "SWING"),
+        ("vane_ud", "AUTO"),
+        ("vane_lr", "SWING"),
+    ]
 
 
 def test_turn_on_off_features_advertised():
