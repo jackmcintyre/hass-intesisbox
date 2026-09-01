@@ -23,14 +23,13 @@ from homeassistant.const import (
     CONF_HOST,
     CONF_NAME,
     CONF_UNIQUE_ID,
-    STATE_UNKNOWN,
     UnitOfTemperature,
 )
 from homeassistant.exceptions import PlatformNotReady
 import homeassistant.helpers.config_validation as cv
 
 from . import DOMAIN, SETUP_TIMEOUT
-from .intesisbox import IntesisBox
+from .intesisbox import IntesisBox, MODES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +84,16 @@ SWING_STOP = "AUTO"
 # The device speaks AUTO, 1-9 and SWING on each vane axis. Present those as
 # readable labels rather than raw protocol tokens.
 VANE_I_TO_E = {"AUTO": "auto", "SWING": "swing"}
+VANE_E_TO_I = {v: k for k, v in VANE_I_TO_E.items()}
+
+# The pre-2.3 swing vocabulary drove both axes from one selector. Automations
+# written against it still call set_swing_mode with these values; map them to
+# per-axis writes rather than sending an unknown token the device will ERR on.
+LEGACY_SWING_TO_AXES = {
+    "vertical": (SWING_ON, None),
+    "horizontal": (SWING_STOP, SWING_ON),
+    "both": (SWING_ON, SWING_ON),
+}
 
 
 def vane_to_ha(value: str | None) -> str | None:
@@ -96,7 +105,7 @@ def vane_to_ha(value: str | None) -> str | None:
 
 def vane_to_device(mode: str) -> str:
     """Map a Home Assistant swing mode back to the device value."""
-    return {v: k for k, v in VANE_I_TO_E.items()}.get(mode, mode).upper()
+    return VANE_E_TO_I.get(mode, mode).upper()
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
@@ -112,7 +121,13 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
     name = config.get(CONF_NAME)
     unique_id = config.get(CONF_UNIQUE_ID)
-    async_add_entities([IntesisBoxAC(controller, name, unique_id)], True)
+    try:
+        entity = IntesisBoxAC(controller, name, unique_id)
+    except Exception:
+        # A retry builds a fresh controller; do not leak this one's socket.
+        controller.stop()
+        raise
+    async_add_entities([entity], True)
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -149,12 +164,13 @@ class IntesisBoxAC(ClimateEntity):
         self._vane_vertical = None
         self._vane_horizontal = None
         self._power = False
-        self._current_operation = STATE_UNKNOWN
+        self._current_operation = None
 
-        # Setup fan list
+        # Setup fan list. The controller deliberately becomes ready even when
+        # the device ignores LIMITS:FANSP, so an empty list is a degraded
+        # device, not a race: offer the entity without fan control rather
+        # than failing setup forever.
         self._fan_list = [x.title() for x in self._controller.fan_speed_list]
-        if len(self._fan_list) < 1:
-            raise PlatformNotReady("Controller hasn't finished initializing device")
         self._fan_speed = None
 
         # Setup operation list. A mode the device reports but we cannot map is
@@ -172,7 +188,14 @@ class IntesisBoxAC(ClimateEntity):
                 continue
             self._operation_list.append(hvac_mode)
         if len(self._operation_list) == 1:
-            raise PlatformNotReady("Controller reported no usable operation modes")
+            # No usable modes reported (LIMITS:MODE ignored, or nothing
+            # mapped): degrade to the standard WMP set instead of failing
+            # setup forever. The device answers ERR to anything unsupported.
+            _LOGGER.warning(
+                "%s reported no usable operation modes; offering the standard set",
+                controller.device_mac_address,
+            )
+            self._operation_list += [MAP_OPERATION_MODE_TO_HA[m] for m in MODES]
 
         # Setup feature support
         self._base_features = ClimateEntityFeature.TARGET_TEMPERATURE
@@ -183,17 +206,11 @@ class IntesisBoxAC(ClimateEntity):
         if len(self._fan_list) > 0:
             self._base_features |= ClimateEntityFeature.FAN_MODE
 
-        # Setup swing control. Home Assistant models the two vane axes
-        # separately, so each is offered only if the unit actually has it -
-        # many units report VANEUD and no VANELR at all.
-        self._swing_list = [vane_to_ha(v) for v in self._controller.vane_vertical_list]
-        self._swing_horizontal_list = [
-            vane_to_ha(v) for v in self._controller.vane_horizontal_list
-        ]
-        # Swing features are not folded into _base_features: a unit that
-        # reports a vane position but refuses to be commanded to one is only
-        # discovered when it rejects a write, so the feature has to be able to
-        # disappear at runtime. See supported_features.
+        # Swing control is not snapshotted here at all: the position lists and
+        # the features are both read live from the controller (see swing_modes
+        # and supported_features), because a unit that reports a vane position
+        # but refuses to be commanded to one is only discovered when it
+        # rejects a write, and a device may reveal an axis only after setup.
 
         _LOGGER.debug("Finished setting up climate entity!")
         self._controller.add_update_callback(self.update_callback)
@@ -285,6 +302,13 @@ class IntesisBoxAC(ClimateEntity):
 
     async def async_set_swing_mode(self, swing_mode):
         """Set the up/down vane position."""
+        legacy = LEGACY_SWING_TO_AXES.get(str(swing_mode).lower())
+        if legacy is not None:
+            vertical, horizontal = legacy
+            await self._controller.async_set_vertical_vane(vertical)
+            if horizontal is not None and self._controller.has_horizontal_vane:
+                await self._controller.async_set_horizontal_vane(horizontal)
+            return
         await self._controller.async_set_vertical_vane(vane_to_device(swing_mode))
 
     async def async_set_swing_horizontal_mode(self, swing_horizontal_mode):
@@ -306,9 +330,11 @@ class IntesisBoxAC(ClimateEntity):
         if self._controller.fan_speed:
             self._fan_speed = self._controller.fan_speed.title()
 
-        # Operation mode
+        # Operation mode. None for a mode we cannot map (or none received
+        # yet): hvac_mode must only ever return an HVACMode or None, because
+        # Home Assistant's state property raises on any other string.
         ib_mode = self._controller.mode
-        self._current_operation = MAP_OPERATION_MODE_TO_HA.get(ib_mode, STATE_UNKNOWN)
+        self._current_operation = MAP_OPERATION_MODE_TO_HA.get(ib_mode)
 
         # Vane positions, one per axis.
         self._vane_vertical = vane_to_ha(self._controller.vertical_swing)
@@ -335,9 +361,15 @@ class IntesisBoxAC(ClimateEntity):
         return icon
 
     def update_callback(self):
-        """Let HA know there has been an update from the controller."""
+        """Let HA know there has been an update from the controller.
+
+        Guarded on entity_id as well as hass: during update_before_add the
+        entity already has hass but no entity_id yet, and writing state in
+        that window raises NoEntitySpecifiedError. The platform writes the
+        state itself as soon as the add completes, so nothing is lost.
+        """
         _LOGGER.debug("IntesisBox sent a status update.")
-        if self.hass:
+        if self.hass and self.entity_id:
             self.schedule_update_ha_state(True)
 
     @property
@@ -389,17 +421,22 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def swing_modes(self):
-        """Available up/down vane positions."""
+        """Available up/down vane positions, read live from the controller.
+
+        Not snapshotted at construction: the feature flag is evaluated live,
+        and the option list must move with it or the entity can advertise
+        SWING_MODE while offering an empty (or stale) list.
+        """
         if not self._controller.has_vertical_vane:
             return []
-        return self._swing_list
+        return [vane_to_ha(v) for v in self._controller.vane_vertical_list]
 
     @property
     def swing_horizontal_modes(self):
-        """Available left/right vane positions."""
+        """Available left/right vane positions, read live from the controller."""
         if not self._controller.has_horizontal_vane:
             return []
-        return self._swing_horizontal_list
+        return [vane_to_ha(v) for v in self._controller.vane_horizontal_list]
 
     @property
     def assumed_state(self) -> bool:

@@ -82,10 +82,15 @@ INIT_COMMANDS = INIT_AWAITED + ["GET,1:*"]
 # replies and the status dump - before becoming ready with whatever turned up.
 LIMITS_GRACE = 5
 
-# An ERR arriving within this long of a command is attributed to it. Commands
-# are serialised and devices answer in tens of milliseconds, so this is ample
-# without risking blaming an unrelated command for a late or stray ERR.
-ERR_ATTRIBUTION_WINDOW = 2.0
+# When every awaited init reply has arrived, only the status dump is still
+# outstanding. It follows within milliseconds on real hardware, so a short
+# settle window replaces the full grace period on that path.
+STATUS_SETTLE = 1.0
+
+# How long a SET may go unanswered before the writer stops holding it for
+# attribution. Devices answer in tens of milliseconds; after this the reply is
+# treated as lost and a later ERR is no longer blamed on the command.
+SET_REPLY_TIMEOUT = 2.0
 
 # Vane positions offered when the device does not answer LIMITS for that axis.
 # The spec (§3) allows AUTO, 1-9 and SWING; most units expose about five
@@ -154,13 +159,19 @@ class IntesisBox(asyncio.Protocol):
         self._tasks: dict[str, asyncio.Task] = {}
         self._stopped = False
 
-        # The last command sent, so a bare ERR can be attributed to it.
-        self._last_command: str | None = None
-        self._last_command_at: float = 0.0
+        # The SET currently awaiting its ACK/ERR. The writer holds the next
+        # command until this resolves, so at most one SET is ever outstanding
+        # and a bare ERR can be attributed to it unambiguously.
+        self._outstanding_set: str | None = None
+        self._set_replied = asyncio.Event()
+
+        # Reconnect backoff, held on the instance so it survives the reconnect
+        # task being cancelled and restarted by connection_lost.
+        self._reconnect_delay = RECONNECT_MIN_DELAY
 
         # Some units report a vane position but refuse to be commanded to one.
-        # Learned from an ERR rather than assumed, and reset on reconnect only
-        # if the device is replaced.
+        # Learned from an ERR rather than assumed. Persists for the lifetime
+        # of this controller instance; an integration reload starts fresh.
         self._vane_settable: dict[str, bool] = {
             FUNCTION_VANEUD: True,
             FUNCTION_VANELR: True,
@@ -210,6 +221,7 @@ class IntesisBox(asyncio.Protocol):
         self._connectionStatus = API_CONNECTING
         self._ready.clear()
         self._pending_init = set(INIT_AWAITED)
+        self._outstanding_set = None
 
         # Drain anything queued while disconnected; it refers to a dead socket.
         while not self._write_queue.empty():
@@ -224,6 +236,15 @@ class IntesisBox(asyncio.Protocol):
             _LOGGER.warning("Connection to IntesisBox %s lost: %r", self._ip, exc)
         else:
             _LOGGER.info("IntesisBox %s closed the connection", self._ip)
+
+        # A drop before the handshake completed is a failed attempt: grow the
+        # backoff here, because cancelling the reconnect task below would
+        # otherwise reset it to the minimum on every accept-then-drop cycle.
+        was_ready = self._connectionStatus == API_AUTHENTICATED
+        if was_ready:
+            self._reconnect_delay = RECONNECT_MIN_DELAY
+        else:
+            self._reconnect_delay = min(self._reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
         self._connectionStatus = API_DISCONNECTED
         self._transport = None
@@ -245,27 +266,34 @@ class IntesisBox(asyncio.Protocol):
         )
 
     async def _reconnect_loop(self) -> None:
-        """Reconnect with exponential backoff until the device answers."""
-        delay = RECONNECT_MIN_DELAY
+        """Reconnect with exponential backoff until the device answers.
+
+        The backoff lives on the instance rather than in a local: closing a
+        half-open transport below fires connection_lost, which cancels and
+        restarts this task, and a local delay would restart at the minimum.
+        """
         while not self._stopped and not self.is_connected:
-            await asyncio.sleep(delay)
+            await asyncio.sleep(self._reconnect_delay)
             if self._stopped:
                 return
             try:
                 await self._open_connection()
             except OSError as exc:
                 _LOGGER.debug("Reconnect to %s failed: %r", self._ip, exc)
-                delay = min(delay * 2, RECONNECT_MAX_DELAY)
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2, RECONNECT_MAX_DELAY
+                )
                 continue
             # Wait for the handshake to complete before declaring victory; a
             # socket that opens but never answers ID is not a usable device.
+            # The budget includes the grace window the handshake itself spends.
             try:
-                async with asyncio.timeout(CONFIRM_TIMEOUT):
+                async with asyncio.timeout(CONFIRM_TIMEOUT + LIMITS_GRACE):
                     await self._ready.wait()
             except TimeoutError:
                 _LOGGER.debug("IntesisBox %s connected but did not answer", self._ip)
+                # connection_lost grows the backoff for this failed attempt.
                 self._close_transport()
-                delay = min(delay * 2, RECONNECT_MAX_DELAY)
                 continue
             _LOGGER.info("Reconnected to IntesisBox %s", self._ip)
             return
@@ -348,9 +376,18 @@ class IntesisBox(asyncio.Protocol):
             except Exception as exc:  # noqa: BLE001 - surface, do not crash writer
                 _LOGGER.error("Failed to send %r: %r", cmd, exc)
                 continue
-            self._last_command = cmd
-            self._last_command_at = self._eventLoop.time()
             _LOGGER.debug("Data sent: %r", cmd)
+            if cmd.startswith("SET,"):
+                # Hold the queue until the device answers this SET, so at most
+                # one is outstanding and a bare ERR is unambiguously its reply.
+                self._outstanding_set = cmd
+                self._set_replied.clear()
+                try:
+                    async with asyncio.timeout(SET_REPLY_TIMEOUT):
+                        await self._set_replied.wait()
+                except TimeoutError:
+                    _LOGGER.debug("No reply to %r within %ss", cmd, SET_REPLY_TIMEOUT)
+                self._outstanding_set = None
             await asyncio.sleep(COMMAND_INTERVAL)
 
     async def _send(self, cmd: str) -> None:
@@ -422,12 +459,16 @@ class IntesisBox(asyncio.Protocol):
         _LOGGER.debug("Data received: %r", line)
 
         if line == "ACK":
+            # The outstanding SET was accepted; release the writer.
+            if self._outstanding_set is not None:
+                self._outstanding_set = None
+                self._set_replied.set()
             return False
         if line == "ERR":
             # The spec (§FAQs) returns a bare ERR for an invalid value or a
             # write to a read-only function, with no indication of which
-            # command failed. Commands are serialised and answered in tens of
-            # milliseconds, so the most recent one is a sound attribution.
+            # command failed. The writer holds the queue while a SET awaits
+            # its reply, so the outstanding SET - if any - is the culprit.
             return self._handle_error_response()
 
         cmdList = line.split(":", 1)
@@ -450,14 +491,11 @@ class IntesisBox(asyncio.Protocol):
         return False
 
     def _handle_error_response(self) -> bool:
-        """Attribute a bare ERR to the command that most likely caused it."""
-        recent = (
-            self._last_command
-            if self._eventLoop
-            and (self._eventLoop.time() - self._last_command_at)
-            <= ERR_ATTRIBUTION_WINDOW
-            else None
-        )
+        """Attribute a bare ERR to the SET awaiting its reply, if any."""
+        recent = self._outstanding_set
+        if recent is not None:
+            self._outstanding_set = None
+            self._set_replied.set()
 
         if recent:
             _LOGGER.warning("IntesisBox %s rejected %r", self._ip, recent)
@@ -495,16 +533,16 @@ class IntesisBox(asyncio.Protocol):
             # Everything mandatory answered, only optional replies outstanding:
             # start the grace timer rather than waiting indefinitely.
             if not self._pending_init & set(INIT_REQUIRED):
-                self._start_task("limits_grace", self._limits_grace())
+                self._start_task("limits_grace", self._limits_grace(LIMITS_GRACE))
             return
 
-        # Even with every reply in, wait out the settle window so the status
-        # dump lands before anyone reads our capabilities.
-        self._start_task("limits_grace", self._limits_grace())
+        # Every reply is in; only the status dump is still on the wire. It
+        # follows within milliseconds, so a short settle suffices here.
+        self._start_task("limits_grace", self._limits_grace(STATUS_SETTLE))
 
-    async def _limits_grace(self) -> None:
+    async def _limits_grace(self, delay: float) -> None:
         """Become ready once the stragglers have had long enough to answer."""
-        await asyncio.sleep(LIMITS_GRACE)
+        await asyncio.sleep(delay)
         if self._ready.is_set():
             return
         if self._pending_init:
@@ -525,6 +563,7 @@ class IntesisBox(asyncio.Protocol):
             self._tasks.pop("limits_grace", None)
         self._pending_init.clear()
         self._connectionStatus = API_AUTHENTICATED
+        self._reconnect_delay = RECONNECT_MIN_DELAY
         self._ready.set()
         _LOGGER.debug("IntesisBox %s ready", self._ip)
 
@@ -670,7 +709,9 @@ class IntesisBox(asyncio.Protocol):
 
     async def async_set_temperature(self, setpoint: float) -> None:
         """Set the target temperature."""
-        await self._set_value(FUNCTION_SETPOINT, int(setpoint * 10))
+        # round(), not int(): 22.3 * 10 is 222.999..., and truncation would
+        # set the device 0.1 degrees below what the user asked for.
+        await self._set_value(FUNCTION_SETPOINT, round(setpoint * 10))
 
     async def async_set_fan_speed(self, fan_speed: str) -> None:
         """Set the fan speed."""
