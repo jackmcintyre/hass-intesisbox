@@ -360,7 +360,9 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def fan_mode(self):
-        """Return whether the fan is on."""
+        """Return the current fan mode, or None before the first update."""
+        if self._fan_speed is None:
+            return None
         return FAN_MODE_I_TO_E.get(self._fan_speed, self._fan_speed).lower()
 
     @property
