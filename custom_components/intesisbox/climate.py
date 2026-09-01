@@ -6,7 +6,6 @@ https://github.com/jnimmo/hass-intesisbox
 
 from __future__ import annotations
 
-import asyncio
 from datetime import timedelta
 import logging
 
@@ -30,12 +29,15 @@ from homeassistant.const import (
 from homeassistant.exceptions import PlatformNotReady
 import homeassistant.helpers.config_validation as cv
 
-from . import DOMAIN
+from . import DOMAIN, SETUP_TIMEOUT
 from .intesisbox import IntesisBox
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NAME = "Intesisbox"
+
+# All commands funnel through one TCP socket.
+PARALLEL_UPDATES = 1
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
@@ -90,9 +92,11 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     from . import intesisbox
 
     controller = intesisbox.IntesisBox(config[CONF_HOST], loop=hass.loop)
-    controller.connect()
-    while not controller.is_connected:
-        await asyncio.sleep(0.1)
+    if not await controller.async_connect(timeout=SETUP_TIMEOUT):
+        controller.stop()
+        raise PlatformNotReady(
+            f"Timed out connecting to IntesisBox at {config[CONF_HOST]}"
+        )
 
     name = config.get(CONF_NAME)
     unique_id = config.get(CONF_UNIQUE_ID)
@@ -135,7 +139,6 @@ class IntesisBoxAC(ClimateEntity):
         self._hswing = False
         self._power = False
         self._current_operation = STATE_UNKNOWN
-        self._connection_retries = 0
         self._has_swing_control = self._controller.has_swing_control
 
         # Setup fan list
@@ -144,12 +147,22 @@ class IntesisBoxAC(ClimateEntity):
             raise PlatformNotReady("Controller hasn't finished initializing device")
         self._fan_speed = None
 
-        # Setup operation list
+        # Setup operation list. A mode the device reports but we cannot map is
+        # skipped with a warning rather than raising, so one unrecognised token
+        # does not cost the user every other mode on the unit.
         self._operation_list = [HVACMode.OFF]
         for operation in self._controller.operation_list:
-            self._operation_list.append(MAP_OPERATION_MODE_TO_HA[operation])
+            hvac_mode = MAP_OPERATION_MODE_TO_HA.get(operation)
+            if hvac_mode is None:
+                _LOGGER.warning(
+                    "Ignoring unsupported operation mode %r reported by %s",
+                    operation,
+                    controller.device_mac_address,
+                )
+                continue
+            self._operation_list.append(hvac_mode)
         if len(self._operation_list) == 1:
-            raise PlatformNotReady
+            raise PlatformNotReady("Controller reported no usable operation modes")
 
         # Setup feature support
         self._base_features = ClimateEntityFeature.TARGET_TEMPERATURE
@@ -215,77 +228,66 @@ class IntesisBoxAC(ClimateEntity):
 
         return attrs
 
-    def set_temperature(self, **kwargs):
+    async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
-        _LOGGER.debug(f"set_temperature({kwargs!r})")
+        _LOGGER.debug("async_set_temperature(%r)", kwargs)
 
         temperature = kwargs.get(ATTR_TEMPERATURE)
         operation_mode = kwargs.get(ATTR_HVAC_MODE)
 
         if operation_mode:
-            self.set_hvac_mode(operation_mode)
+            await self.async_set_hvac_mode(operation_mode)
 
         if temperature:
-            self._controller.set_temperature(temperature)
+            await self._controller.async_set_temperature(temperature)
 
-    def set_hvac_mode(self, operation_mode):
+    async def async_set_hvac_mode(self, hvac_mode):
         """Set operation mode."""
-        _LOGGER.debug(f"set_hvac_mode({operation_mode=})")
-        if operation_mode == HVACMode.OFF:
-            self._controller.set_power_off()
+        _LOGGER.debug("async_set_hvac_mode(%s)", hvac_mode)
+        if hvac_mode == HVACMode.OFF:
+            await self._controller.async_set_power_off()
             self._power = False
         else:
-            self._controller.set_mode(MAP_OPERATION_MODE_TO_IB[operation_mode])
+            await self._controller.async_set_mode(MAP_OPERATION_MODE_TO_IB[hvac_mode])
 
-            # Send the temperature again in case changing modes has changed it
-            if self._target_temperature:
-                self._controller.set_temperature(self._target_temperature)
+        self.async_write_ha_state()
 
-        self.schedule_update_ha_state(False)
-
-    def turn_on(self):
+    async def async_turn_on(self):
         """Turn thermostat on."""
-        self._controller.set_power_on()
-        self.schedule_update_ha_state(False)
+        await self._controller.async_set_power_on()
+        self.async_write_ha_state()
 
-    def turn_off(self):
+    async def async_turn_off(self):
         """Turn thermostat off."""
-        self.set_hvac_mode(HVACMode.OFF)
+        await self.async_set_hvac_mode(HVACMode.OFF)
 
-    def set_fan_mode(self, fan_mode):
+    async def async_set_fan_mode(self, fan_mode):
         """Set fan mode (from quiet, low, medium, high, auto)."""
         target = FAN_MODE_E_TO_I.get(fan_mode, fan_mode)
         _LOGGER.debug(
-            f"set_fan_mode({fan_mode=}) -> set_fan_speed(target={target.upper()})"
+            "async_set_fan_mode(%s) -> fan speed %s", fan_mode, target.upper()
         )
-        self._controller.set_fan_speed(target.upper())
+        await self._controller.async_set_fan_speed(target.upper())
 
-    def set_swing_mode(self, swing_mode):
+    async def async_set_swing_mode(self, swing_mode):
         """Set the vertical vane."""
         if swing_mode == SWING_LIST_BOTH:
-            self._controller.set_vertical_vane(SWING_ON)
-            self._controller.set_horizontal_vane(SWING_ON)
+            await self._controller.async_set_vertical_vane(SWING_ON)
+            await self._controller.async_set_horizontal_vane(SWING_ON)
         elif swing_mode == SWING_LIST_STOP:
-            self._controller.set_vertical_vane(SWING_STOP)
-            self._controller.set_horizontal_vane(SWING_STOP)
+            await self._controller.async_set_vertical_vane(SWING_STOP)
+            await self._controller.async_set_horizontal_vane(SWING_STOP)
         elif swing_mode == SWING_LIST_HORIZONTAL:
-            self._controller.set_vertical_vane(SWING_STOP)
-            self._controller.set_horizontal_vane(SWING_ON)
+            await self._controller.async_set_vertical_vane(SWING_STOP)
+            await self._controller.async_set_horizontal_vane(SWING_ON)
         elif swing_mode == SWING_LIST_VERTICAL:
-            self._controller.set_vertical_vane(SWING_ON)
-            self._controller.set_horizontal_vane(SWING_STOP)
+            await self._controller.async_set_vertical_vane(SWING_ON)
+            await self._controller.async_set_horizontal_vane(SWING_STOP)
 
     async def async_update(self):
         """Copy values from controller dictionary to climate device."""
-        if not self._controller.is_connected:
-            await asyncio.sleep(
-                5
-            )  # per device specs, wait minimum 1 second before re-connecting
-            await self.hass.async_add_executor_job(self._controller.connect)
-            self._connection_retries += 1
-        else:
-            self._connection_retries = 0
-
+        # Reconnection is owned by the controller's own backoff loop; this only
+        # mirrors the current state onto the entity.
         self._power = self._controller.is_on
         self._current_temp = self._controller.ambient_temperature
         self._min_temp = self._controller.min_setpoint
@@ -309,9 +311,9 @@ class IntesisBoxAC(ClimateEntity):
         if self._connected != self._controller.is_connected:
             self._connected = self._controller.is_connected
             if self._connected:
-                _LOGGER.debug("Connection to Intesisbox was restored.")
+                _LOGGER.info("Connection to IntesisBox was restored.")
             else:
-                _LOGGER.debug("Lost connection to Intesisbox.")
+                _LOGGER.warning("Lost connection to IntesisBox.")
 
     async def async_will_remove_from_hass(self):
         """Shutdown the controller when the device is being removed."""
@@ -327,7 +329,7 @@ class IntesisBoxAC(ClimateEntity):
 
     def update_callback(self):
         """Let HA know there has been an update from the controller."""
-        _LOGGER.debug("Intesisbox sent a status update.")
+        _LOGGER.debug("IntesisBox sent a status update.")
         if self.hass:
             self.schedule_update_ha_state(True)
 
@@ -348,10 +350,8 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def should_poll(self):
-        """Poll for updates if pyIntesisbox doesn't have a socket open."""
-        # This could be switched on controller.is_connected, but HA doesn't
-        # seem to handle dynamically changing from push to poll.
-        return True
+        """No polling: the controller holds a socket open and pushes changes."""
+        return False
 
     @property
     def hvac_modes(self):
@@ -360,7 +360,9 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def fan_mode(self):
-        """Return whether the fan is on."""
+        """Return the current fan mode, or None before the first update."""
+        if self._fan_speed is None:
+            return None
         return FAN_MODE_I_TO_E.get(self._fan_speed, self._fan_speed).lower()
 
     @property
@@ -392,8 +394,8 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def available(self) -> bool:
-        """If the device hasn't been able to connect, mark as unavailable."""
-        return self._connected or self._connection_retries < 2
+        """Unavailable while the controller has no working connection."""
+        return self._controller.is_connected
 
     @property
     def current_temperature(self):
@@ -409,10 +411,14 @@ class IntesisBoxAC(ClimateEntity):
 
     @property
     def target_temperature(self):
-        """Return the current setpoint temperature if unit is on and not FAN or OFF Mode."""
-        if self._power and self.hvac_mode not in [HVACMode.FAN_ONLY, HVACMode.OFF]:
-            return self._target_temperature
-        return None
+        """Return the set point the device is reporting.
+
+        No need to second-guess this by power state: the device reports a null
+        set point (32768, mapped to None) in modes where one does not apply, so
+        FAN mode already yields None on its own. Suppressing it while the unit
+        is merely off just loses the value from the card and from history.
+        """
+        return self._target_temperature
 
     @property
     def supported_features(self):
