@@ -108,3 +108,5 @@ venv.bak/
 
 # Ignore Mac DS_Store files
 .DS_Store
+upstream-draft-*.md
+REVIEW-HANDOFF.md
