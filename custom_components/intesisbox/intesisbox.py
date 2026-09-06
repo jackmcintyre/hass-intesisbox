@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 import logging
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -934,6 +935,40 @@ class IntesisBox(asyncio.Protocol):
     def is_disconnected(self) -> bool:
         """Returns true when the TCP connection is disconnected and idle."""
         return self._connectionStatus == API_DISCONNECTED
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def diagnostics(self) -> dict[str, Any]:
+        """A snapshot for a bug report: identity, capabilities, state, tasks.
+
+        Everything here had to be extracted by hand from debug logs while
+        diagnosing earlier issues. Identifying fields are redacted by the
+        diagnostics platform before download.
+        """
+        return {
+            "model": self._model,
+            "firmware": self._firmversion,
+            "mac": self._mac,
+            "controller_type": self._controllerType,
+            "rssi": self._rssi,
+            "connection": self._connectionStatus,
+            "ready": self._ready.is_set(),
+            "pending_init": sorted(self._pending_init),
+            "limits": {
+                "setpoint": [self._setpoint_minimum, self._setpoint_maximum],
+                "fan_speeds": list(self._fan_speed_list),
+                "modes": list(self._operation_list),
+                "vane_vertical": list(self._vertical_vane_list),
+                "vane_horizontal": list(self._horizontal_vane_list),
+            },
+            "vane_settable": dict(self._vane_settable),
+            "state": dict(self._device),
+            "tasks": sorted(n for n, t in self._tasks.items() if not t.done()),
+            "outstanding_set": self._outstanding_set,
+            "reconnect_delay": self._reconnect_delay,
+        }
 
     # ------------------------------------------------------------------
     # Callbacks

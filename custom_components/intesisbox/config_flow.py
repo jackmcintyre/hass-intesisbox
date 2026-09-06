@@ -117,9 +117,3 @@ class IntesisboxFlowHandler(ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
         )
-
-    async def async_step_import(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Import a config entry."""
-        return await self.async_step_user(user_input)

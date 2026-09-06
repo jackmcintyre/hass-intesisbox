@@ -416,6 +416,15 @@ def test_entity_does_not_poll():
     assert make_entity().should_poll is False
 
 
+def test_yaml_platform_is_gone():
+    """Config entries only: a YAML platform opened a second socket to a box
+    that may already have one, and a WMP device only allows two."""
+    from custom_components.intesisbox import climate
+
+    assert not hasattr(climate, "async_setup_platform")
+    assert not hasattr(climate, "PLATFORM_SCHEMA")
+
+
 # --------------------------------------------------------------------------
 # Naming
 # --------------------------------------------------------------------------

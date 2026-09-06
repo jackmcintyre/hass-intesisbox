@@ -6,50 +6,23 @@ https://github.com/jnimmo/hass-intesisbox
 
 from __future__ import annotations
 
-from datetime import timedelta
 import logging
 
-import voluptuous as vol
-
 from homeassistant.components.climate import (
-    PLATFORM_SCHEMA,
     ClimateEntity,
     ClimateEntityFeature,
     HVACMode,
 )
 from homeassistant.components.climate.const import ATTR_HVAC_MODE
-from homeassistant.const import (
-    ATTR_TEMPERATURE,
-    CONF_HOST,
-    CONF_NAME,
-    CONF_UNIQUE_ID,
-    UnitOfTemperature,
-)
-from homeassistant.exceptions import PlatformNotReady
-import homeassistant.helpers.config_validation as cv
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 
-from . import DOMAIN, SETUP_TIMEOUT, IntesisBoxConfigEntry
+from . import DOMAIN, IntesisBoxConfigEntry
 from .intesisbox import IntesisBox, MODES
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_NAME = "Intesisbox"
-
 # All commands funnel through one TCP socket.
 PARALLEL_UPDATES = 1
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_UNIQUE_ID): cv.string,
-    }
-)
-
-# Return cached results if last scan time was less than this value.
-# If a persistent connection is established for the controller, changes to
-# values are in realtime.
-SCAN_INTERVAL = timedelta(seconds=300)
 
 MAP_OPERATION_MODE_TO_HA = {
     "AUTO": HVACMode.HEAT_COOL,
@@ -106,28 +79,6 @@ def vane_to_ha(value: str | None) -> str | None:
 def vane_to_device(mode: str) -> str:
     """Map a Home Assistant swing mode back to the device value."""
     return VANE_E_TO_I.get(mode, mode).upper()
-
-
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Create the Intesisbox climate devices."""
-    from . import intesisbox
-
-    controller = intesisbox.IntesisBox(config[CONF_HOST], loop=hass.loop)
-    if not await controller.async_connect(timeout=SETUP_TIMEOUT):
-        controller.stop()
-        raise PlatformNotReady(
-            f"Timed out connecting to IntesisBox at {config[CONF_HOST]}"
-        )
-
-    name = config.get(CONF_NAME)
-    unique_id = config.get(CONF_UNIQUE_ID)
-    try:
-        entity = IntesisBoxAC(controller, name, unique_id)
-    except Exception:
-        # A retry builds a fresh controller; do not leak this one's socket.
-        controller.stop()
-        raise
-    async_add_entities([entity], True)
 
 
 async def async_setup_entry(
