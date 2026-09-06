@@ -13,6 +13,9 @@ from . import IntesisBoxConfigEntry
 from .entity import IntesisBoxEntity
 from .intesisbox import IntesisBox
 
+# Read-only entities; nothing here writes to the device.
+PARALLEL_UPDATES = 0
+
 
 async def async_setup_entry(
     hass, entry: IntesisBoxConfigEntry, async_add_entities
@@ -35,7 +38,7 @@ class IntesisBoxFaultCode(IntesisBoxEntity, SensorEntity):
     """
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_name = "Fault code"
+    _attr_translation_key = "fault_code"
 
     def __init__(self, controller: IntesisBox, device_name: str) -> None:
         """Set up the fault code sensor."""
@@ -61,7 +64,7 @@ class IntesisBoxSignalStrength(IntesisBoxEntity, SensorEntity):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_entity_registry_enabled_default = False
-    _attr_name = "Signal strength"
+    _attr_translation_key = "signal_strength"
 
     def __init__(self, controller: IntesisBox, device_name: str) -> None:
         """Set up the signal strength sensor."""

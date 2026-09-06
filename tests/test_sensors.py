@@ -6,7 +6,7 @@ the integration used to receive all three and discard them.
 
 from __future__ import annotations
 
-from custom_components.intesisbox import DOMAIN
+from custom_components.intesisbox import DOMAIN, binary_sensor, sensor
 from custom_components.intesisbox.binary_sensor import IntesisBoxFault
 from custom_components.intesisbox.climate import IntesisBoxAC
 from custom_components.intesisbox.sensor import (
@@ -98,3 +98,28 @@ def test_all_entities_land_on_the_same_device():
         f"{controller.device_mac_address}-fault",
         f"{controller.device_mac_address}-fault_code",
     }
+
+
+def test_read_only_platforms_declare_no_parallel_updates():
+    assert sensor.PARALLEL_UPDATES == 0
+    assert binary_sensor.PARALLEL_UPDATES == 0
+
+
+def test_diagnostic_entities_use_translation_keys():
+    """Names come from translations/en.json, not hard-coded strings."""
+    controller = FakeController()
+    assert IntesisBoxFault(controller, "x").translation_key == "fault"
+    assert IntesisBoxFaultCode(controller, "x").translation_key == "fault_code"
+    assert (
+        IntesisBoxSignalStrength(controller, "x").translation_key == "signal_strength"
+    )
+
+
+async def test_diagnostic_entity_unsubscribes_on_remove():
+    controller = FakeController()
+    fault = _attach(IntesisBoxFault(controller, "x"))
+    await fault.async_added_to_hass()
+    assert len(controller._update_callbacks) == 1
+    fault._call_on_remove_callbacks()
+    assert controller._update_callbacks == []
+    assert controller.stopped is False

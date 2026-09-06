@@ -174,7 +174,6 @@ class IntesisBoxAC(ClimateEntity):
         # rejects a write, and a device may reveal an axis only after setup.
 
         _LOGGER.debug("Finished setting up climate entity!")
-        self._controller.add_update_callback(self.update_callback)
 
     @property
     def name(self) -> None:
@@ -309,9 +308,18 @@ class IntesisBoxAC(ClimateEntity):
             else:
                 _LOGGER.warning("Lost connection to IntesisBox.")
 
-    async def async_will_remove_from_hass(self):
-        """Shutdown the controller when the device is being removed."""
-        self._controller.stop()
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to controller pushes once added; unsubscribe on removal.
+
+        The controller is shared with the diagnostic platforms and owned by
+        the config entry, which stops it on unload. An entity must never stop
+        it: disabling just the climate entity would otherwise take the fault
+        and signal sensors down with it.
+        """
+        self._controller.add_update_callback(self.update_callback)
+        self.async_on_remove(
+            lambda: self._controller.remove_update_callback(self.update_callback)
+        )
 
     @property
     def icon(self):

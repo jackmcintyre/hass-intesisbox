@@ -53,6 +53,8 @@ class Emulator(asyncio.Protocol):
     #: Functions the device reports but refuses to be commanded to. Observed
     #: on TO-RC-WMP-1, which reports VANEUD and rejects every SET for it.
     readonly_functions: set[str] = set()
+    #: Accept the connection and answer nothing at all.
+    silent = False
     #: Live connections, so a test can drop them.
     connections: list[Emulator] = []
 
@@ -72,6 +74,7 @@ class Emulator(asyncio.Protocol):
         cls.unanswered_limits = set()
         cls.absent_functions = set()
         cls.readonly_functions = set()
+        cls.silent = False
         cls.connections = []
 
     @classmethod
@@ -120,6 +123,8 @@ class Emulator(asyncio.Protocol):
 
     def handle(self, line: str) -> None:
         """Respond to one command."""
+        if Emulator.silent:
+            return
         head = line.split(",")[0]
 
         if line == "ID":

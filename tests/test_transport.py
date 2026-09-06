@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -366,3 +367,297 @@ def test_removed_update_callback_is_not_called():
     box.remove_update_callback(cb)  # tolerated
     box.data_received(b"CHN,1:MODE,HEAT\r\n")
     assert not calls
+
+
+# --------------------------------------------------------------------------
+# Failure paths, driven deterministically
+# --------------------------------------------------------------------------
+
+
+class FakeTransport:
+    """Stands in for asyncio's transport so writer paths can be forced."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.written: list[bytes] = []
+        self.fail = fail
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        if self.fail:
+            raise OSError("socket went away")
+        self.written.append(data)
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
+
+async def _settle(box) -> None:
+    box.stop()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+
+def test_garbage_and_edge_lines_are_tolerated(caplog):
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    with caplog.at_level(logging.WARNING):
+        box.data_received(
+            b"\r\n\r\n"  # blank lines
+            b"CHN,1:MODE,H\xc3\xa9AT\r\n"  # non-ASCII
+            b"HELLO\r\n"  # no colon
+            b"PONG\r\n"  # bare keepalive answer
+            b"ID:too,short\r\n"
+            b"LIMITS:SETPTEMP,[a,b]\r\n"
+            b"LIMITS:WIBBLE,[1,2]\r\n"
+            b"CHN,1:AMBTEMP,32768\r\n"  # the null value
+            b"ERR\r\n"  # nothing outstanding to blame
+        )
+    assert "non-ASCII" in caplog.text
+    assert "Unexpected ID reply" in caplog.text
+    assert "Non-numeric setpoint limits" in caplog.text
+    assert "rejected a command" in caplog.text
+    assert box.ambient_temperature is None
+    assert box.device_mac_address is None
+
+
+def test_a_parser_exception_does_not_kill_the_socket(caplog):
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    box._parse_change_received = lambda args: 1 / 0  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        box.data_received(b"CHN,1:MODE,HEAT\r\nCHN,1:ONOFF,ON\r\n")
+    assert "Failed to process line" in caplog.text
+
+
+def test_properties_read_the_device_dict():
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    box.data_received(b"CHN,1:FANSP,2\r\nCHN,1:VANELR,3\r\nCHN,1:VANEUD,1\r\n")
+    assert box.fan_speed == "2"
+    assert box.horizontal_swing == "3"
+    assert box.has_swing_control
+    assert box.error_message is None
+    box._send_error_callback("boom")
+    assert box.error_message == "boom"
+
+
+async def test_background_task_failures_are_logged(caplog):
+    async def boom():
+        raise RuntimeError("task blew up")
+
+    with caplog.at_level(logging.ERROR):
+        task = intesisbox.ensure_background_task(boom(), asyncio.get_running_loop())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    assert task.done()
+    assert "Background task failed" in caplog.text
+
+
+async def test_send_threadsafe_queues_from_another_thread():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    await loop.run_in_executor(None, box.send_threadsafe, "PING")
+    await asyncio.sleep(0.05)
+    assert box._write_queue.get_nowait() == "PING"
+
+
+async def test_connection_made_drains_stale_commands_and_writes_the_handshake():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    box._write_queue.put_nowait("STALE")
+    transport = FakeTransport()
+    box.connection_made(transport)
+    await asyncio.sleep(0.05)
+    assert b"STALE\r" not in transport.written
+    assert transport.written[0] == b"ID\r"
+    await _settle(box)
+
+
+async def test_writer_drops_commands_when_the_transport_is_gone(monkeypatch, caplog):
+    monkeypatch.setattr(intesisbox, "COMMAND_INTERVAL", 0.01)
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    box.connection_made(FakeTransport())
+    await asyncio.sleep(0.05)
+    box._transport = None
+    with caplog.at_level(logging.DEBUG, logger="intesisbox"):
+        await box._send("GET,1:MODE")
+        await asyncio.sleep(0.3)
+    assert "Dropping" in caplog.text
+    await _settle(box)
+
+
+async def test_writer_survives_a_failing_transport(caplog):
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    with caplog.at_level(logging.ERROR):
+        box.connection_made(FakeTransport(fail=True))
+        await asyncio.sleep(0.1)
+    assert "Failed to send" in caplog.text
+    live = box._tasks["writer"]
+    assert not live.done(), "one bad write must not kill the writer"
+    await _settle(box)
+
+
+async def test_unanswered_set_releases_the_writer(monkeypatch, caplog):
+    monkeypatch.setattr(intesisbox, "SET_REPLY_TIMEOUT", 0.1)
+    monkeypatch.setattr(intesisbox, "COMMAND_INTERVAL", 0.01)
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    transport = FakeTransport()
+    box.connection_made(transport)
+    with caplog.at_level(logging.DEBUG, logger="intesisbox"):
+        await box.async_set_power_off()
+        await box.async_set_horizontal_vane("1")
+        await asyncio.sleep(0.8)
+    assert b"SET,1:ONOFF,OFF\r" in transport.written
+    assert b"SET,1:VANELR,1\r" in transport.written, "queue must move on"
+    assert "No reply" in caplog.text
+    await _settle(box)
+
+
+async def test_periodic_tasks_send_keepalive_and_ambient_poll(monkeypatch):
+    monkeypatch.setattr(intesisbox, "COMMAND_INTERVAL", 0.01)
+    monkeypatch.setattr(intesisbox, "KEEPALIVE_INTERVAL", 0.05)
+    monkeypatch.setattr(intesisbox, "AMBTEMP_POLL_INTERVAL", 0.05)
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    transport = FakeTransport()
+    box.connection_made(transport)
+    box._become_ready()
+    await asyncio.sleep(0.4)
+    assert b"PING\r" in transport.written
+    assert b"GET,1:AMBTEMP\r" in transport.written
+    assert b"GET,1:*\r" in transport.written
+    await _settle(box)
+
+
+async def test_ready_can_be_forced_from_outside_the_grace_task():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    box._pending_init = {"ID", "LIMITS:FANSP"}
+    box.data_received(b"ID:IS-IR-WMP-1,001DC9A2C911,1.2.3.4,ASCII,v1,-40\r\n")
+    assert "limits_grace" in box._tasks  # only the optional reply is outstanding
+    box._become_ready()  # not from inside the grace task: it must be cancelled
+    await asyncio.sleep(0)
+    assert box.is_connected
+    assert "limits_grace" not in box._tasks
+    # A late reply after readiness is ignored, even with a stale pending entry.
+    box._pending_init = {"LIMITS:VANEUD"}
+    box.data_received(b"LIMITS:FANSP,[AUTO,1]\r\n")
+    assert box.is_initialized
+    assert "limits_grace" not in box._tasks
+    await _settle(box)
+
+
+async def test_change_waiters_time_out_and_fail_on_disconnect():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    assert await box._wait_for_value("MODE", "HEAT", timeout=0.05) is False
+    assert box._change_waiters == []
+
+    waiting = loop.create_task(box._wait_for_value("MODE", "HEAT", timeout=5))
+    await asyncio.sleep(0)
+    box._fail_change_waiters(ConnectionResetError("dropped"))
+    assert await waiting is False
+
+
+async def test_set_mode_edge_cases(caplog):
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    with caplog.at_level(logging.WARNING):
+        await box.async_set_mode("WIBBLE")
+    assert "unsupported mode" in caplog.text
+    assert box._write_queue.empty()
+
+    box.data_received(b"CHN,1:ONOFF,ON\r\n")
+    await box.async_set_mode("HEAT")  # already on: no confirm-then-power-on
+    assert box._write_queue.get_nowait() == "SET,1:MODE,HEAT"
+    assert box._write_queue.empty()
+
+    box.data_received(b"CHN,1:ONOFF,OFF\r\n")
+
+    async def never(*a, **k):
+        return False
+
+    box._wait_for_value = never  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        await box.async_set_mode("COOL")
+    assert "did not confirm mode" in caplog.text
+
+
+async def test_connection_lost_after_stop_does_not_reconnect():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    box.stop()
+    box.connection_lost(OSError("reset"))
+    assert "reconnect" not in box._tasks
+
+
+async def test_missing_address_is_a_connection_failure():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("", 0, loop=loop)
+    assert await box.async_connect(timeout=1) is False
+    await _settle(box)
+
+
+async def test_reconnect_backs_off_while_the_device_is_unreachable():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)  # nothing listens on 1
+    box._reconnect_delay = 0.05
+    box._schedule_reconnect()
+    await asyncio.sleep(0.5)
+    assert box._reconnect_delay > 0.05
+    assert not box.is_connected
+    await _settle(box)
+
+
+async def test_silent_device_times_out_the_handshake(monkeypatch, port):
+    """A box that accepts TCP and never answers must not count as connected."""
+    monkeypatch.setattr(intesisbox, "CONFIRM_TIMEOUT", 0.3)
+    monkeypatch.setattr(intesisbox, "LIMITS_GRACE", 0.1)
+    Emulator.silent = True
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        assert await box.async_connect(timeout=0.5) is False
+        assert not box.is_connected
+        # The reconnect loop now owns the retry; let it hit the same wall once.
+        box._reconnect_delay = 0.05
+        await asyncio.sleep(1.2)
+        assert not box.is_connected
+        assert box._reconnect_delay > 0.05, "a failed handshake must grow the backoff"
+    finally:
+        await _settle(box)
+
+
+async def test_connect_and_async_connect_are_idempotent_once_connected(port):
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        box.connect()
+        for _ in range(60):
+            await asyncio.sleep(0.1)
+            if box.is_connected:
+                break
+        assert box.is_connected
+        assert await box.async_connect(timeout=1) is True
+        box.connect()  # no second connection
+        assert len(Emulator.connections) == 1
+    finally:
+        await _settle(box)
+
+
+async def test_horizontal_vane_and_power_off_are_queued():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    await box.async_set_horizontal_vane("SWING")
+    await box.async_set_power_off()
+    assert box._write_queue.get_nowait() == "SET,1:VANELR,SWING"
+    assert box._write_queue.get_nowait() == "SET,1:ONOFF,OFF"
+
+
+def test_vane_list_prefers_reported_limits_and_tolerates_unknowns():
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    assert box.vane_horizontal_list == []  # never reported, no limits
+    box.data_received(b"LIMITS:VANELR,[AUTO,1,SWING]\r\n")
+    assert box.vane_horizontal_list == ["AUTO", "1", "SWING"]
+    assert box.has_horizontal_vane

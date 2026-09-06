@@ -12,6 +12,9 @@ from . import IntesisBoxConfigEntry
 from .entity import IntesisBoxEntity
 from .intesisbox import IntesisBox
 
+# Read-only entities; nothing here writes to the device.
+PARALLEL_UPDATES = 0
+
 
 async def async_setup_entry(
     hass, entry: IntesisBoxConfigEntry, async_add_entities
@@ -30,7 +33,7 @@ class IntesisBoxFault(IntesisBoxEntity, BinarySensorEntity):
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_name = "Fault"
+    _attr_translation_key = "fault"
 
     def __init__(self, controller: IntesisBox, device_name: str) -> None:
         """Set up the fault sensor."""
