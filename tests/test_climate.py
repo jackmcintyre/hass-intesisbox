@@ -69,6 +69,11 @@ class FakeController:
         self.horizontal_swing = None
         self.is_on = False
 
+        # Diagnostic channel, as a healthy unit reports it.
+        self.error_status = "OK"
+        self.error_code = "0"
+        self.rssi = "-54"
+
         self.calls: list[tuple[str, object]] = []
         self._update_callbacks = []
 
@@ -89,6 +94,10 @@ class FakeController:
     def add_update_callback(self, method):
         """Record the entity's callback."""
         self._update_callbacks.append(method)
+
+    def remove_update_callback(self, method):
+        """Forget the entity's callback."""
+        self._update_callbacks.remove(method)
 
     async def async_set_temperature(self, value):
         """Record a set point write."""

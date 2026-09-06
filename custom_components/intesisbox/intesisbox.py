@@ -458,6 +458,8 @@ class IntesisBox(asyncio.Protocol):
         """Handle one complete line. Returns True if state changed."""
         _LOGGER.debug("Data received: %r", line)
 
+        if line == "PONG":
+            return False
         if line == "ACK":
             # The outstanding SET was accepted; release the writer.
             if self._outstanding_set is not None:
@@ -479,6 +481,12 @@ class IntesisBox(asyncio.Protocol):
         if cmd == "ID":
             self._parse_id_received(args)
             self._mark_init_complete("ID")
+            return True
+        if cmd == "PONG":
+            # Not in the spec: real gateways answer PING with PONG:<rssi>, a
+            # live signal reading. Treat it as a state change so it reaches
+            # the signal strength sensor.
+            self._rssi = args.strip() or self._rssi
             return True
         if cmd == "CHN,1":
             self._parse_change_received(args)
@@ -566,6 +574,9 @@ class IntesisBox(asyncio.Protocol):
         self._reconnect_delay = RECONNECT_MIN_DELAY
         self._ready.set()
         _LOGGER.debug("IntesisBox %s ready", self._ip)
+        # Availability just changed; tell the entities rather than leaving
+        # them to notice on the next status push.
+        self._send_update_callback()
 
         # Start the periodic tasks only once the handshake is done, and only
         # ever one of each.
@@ -878,8 +889,21 @@ class IntesisBox(asyncio.Protocol):
 
     @property
     def rssi(self) -> str | None:
-        """Wireless signal strength of the IntesisBox."""
+        """Wireless signal strength of the IntesisBox.
+
+        From the ID reply at connect, then refreshed by every PONG.
+        """
         return self._rssi
+
+    @property
+    def error_status(self) -> str | None:
+        """OK, or ERR while the indoor unit reports a fault."""
+        return self._device.get(FUNCTION_ERRSTATUS)
+
+    @property
+    def error_code(self) -> str | None:
+        """The indoor unit's fault code, as the device reports it."""
+        return self._device.get(FUNCTION_ERRCODE)
 
     @property
     def vertical_swing(self) -> str | None:
@@ -936,6 +960,13 @@ class IntesisBox(asyncio.Protocol):
     def add_update_callback(self, method):
         """Public method to add a callback subscriber."""
         self._updateCallbacks.append(method)
+
+    def remove_update_callback(self, method):
+        """Stop notifying a subscriber, e.g. an entity being removed."""
+        try:
+            self._updateCallbacks.remove(method)
+        except ValueError:
+            pass
 
     def add_error_callback(self, method):
         """Public method to add a callback subscriber."""

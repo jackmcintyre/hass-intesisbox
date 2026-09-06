@@ -10,7 +10,9 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from .intesisbox import IntesisBox
 
 DOMAIN = "intesisbox"
-PLATFORMS = ["climate"]
+# climate first: it is the entity people look for. The diagnostics attach to
+# the same device.
+PLATFORMS = ["climate", "binary_sensor", "sensor"]
 
 # Seconds to wait for the device to answer ID and every LIMITS query before
 # giving up and letting Home Assistant retry the entry.
