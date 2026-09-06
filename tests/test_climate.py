@@ -405,3 +405,20 @@ def test_unavailable_when_controller_disconnected():
 def test_entity_does_not_poll():
     """The controller pushes changes, so Home Assistant should not poll."""
     assert make_entity().should_poll is False
+
+
+# --------------------------------------------------------------------------
+# Naming
+# --------------------------------------------------------------------------
+
+
+def test_entity_takes_its_name_from_the_device():
+    """With has_entity_name the device carries the name and the entity has none.
+
+    Previously a config-entry install named the entity after the MAC address
+    until the user renamed it.
+    """
+    entity = make_entity(FakeController(), name="Study Air Con")
+    assert entity.has_entity_name is True
+    assert entity.name is None
+    assert entity.device_info["name"] == "Study Air Con"

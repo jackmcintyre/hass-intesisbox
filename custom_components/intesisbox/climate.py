@@ -28,7 +28,7 @@ from homeassistant.const import (
 from homeassistant.exceptions import PlatformNotReady
 import homeassistant.helpers.config_validation as cv
 
-from . import DOMAIN, SETUP_TIMEOUT
+from . import DOMAIN, SETUP_TIMEOUT, IntesisBoxConfigEntry
 from .intesisbox import IntesisBox, MODES
 
 _LOGGER = logging.getLogger(__name__)
@@ -130,14 +130,24 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     async_add_entities([entity], True)
 
 
-async def async_setup_entry(hass, entry, async_add_entities):
-    """Add entries from config."""
-    controller = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([IntesisBoxAC(controller)], True)
+async def async_setup_entry(
+    hass, entry: IntesisBoxConfigEntry, async_add_entities
+) -> None:
+    """Add the climate entity for a config entry.
+
+    The entry title is the device's name. With has_entity_name the entity
+    takes its name from the device, so a fresh install no longer shows a MAC
+    address until the user renames it.
+    """
+    async_add_entities([IntesisBoxAC(entry.runtime_data, name=entry.title)], True)
 
 
 class IntesisBoxAC(ClimateEntity):
     """Represents an Intesisbox air conditioning device."""
+
+    # The device carries the name; the single climate entity has none of its
+    # own, so renaming the device renames the entity with it.
+    _attr_has_entity_name = True
 
     def __init__(
         self,
@@ -216,9 +226,9 @@ class IntesisBoxAC(ClimateEntity):
         self._controller.add_update_callback(self.update_callback)
 
     @property
-    def name(self):
-        """Return the name of the AC device."""
-        return self._devicename
+    def name(self) -> None:
+        """No entity-level name: with has_entity_name it is the device's."""
+        return None
 
     @property
     def unique_id(self):
@@ -235,7 +245,7 @@ class IntesisBoxAC(ClimateEntity):
         """Info about the IntesisBox itself."""
         return {
             "identifiers": {(DOMAIN, self.unique_id)},
-            "name": self.name,
+            "name": self._devicename,
             "manufacturer": "Intesis",
             "model": self._controller.device_model,
             "sw_version": self._controller.firmware_version,
