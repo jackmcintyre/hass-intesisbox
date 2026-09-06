@@ -35,7 +35,7 @@ async def _async_identify(hass: HomeAssistant, host: str) -> str | None:
         controller.stop()
 
 
-class IntesisboxFlowHandler(ConfigFlow, domain=DOMAIN):
+class IntesisboxFlowHandler(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg]
     """Handle a config flow."""
 
     VERSION = 1

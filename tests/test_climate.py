@@ -9,6 +9,7 @@ live in how Home Assistant reads its properties.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from custom_components.intesisbox.climate import IntesisBoxAC
 from homeassistant.components.climate import ClimateEntityFeature, HVACMode
@@ -150,9 +151,10 @@ class FakeController:
         self.calls.append(("vane_lr", value))
 
 
-def make_entity(controller=None, **kwargs) -> IntesisBoxAC:
+def make_entity(controller: Any = None, **kwargs) -> IntesisBoxAC:
     """Build an entity with a stub hass and inert state writes."""
-    entity = IntesisBoxAC(controller or FakeController(), **kwargs)
+    fake: Any = controller if controller is not None else FakeController()
+    entity = IntesisBoxAC(fake, **kwargs)
     entity.hass = FakeHass()
     entity.async_write_ha_state = lambda: None
     return entity
