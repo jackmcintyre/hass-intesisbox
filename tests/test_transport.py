@@ -15,6 +15,15 @@ import pytest
 
 from .emulator import ID_V6, Emulator, start
 
+
+@pytest.fixture(autouse=True)
+def _real_sockets(socket_enabled):
+    """The emulator is a real TCP server on 127.0.0.1.
+
+    The Home Assistant test harness blocks socket construction for every test
+    by default; this opts the transport tests back in.
+    """
+
 _SPEC = importlib.util.spec_from_file_location(
     "intesisbox",
     Path(__file__).parent.parent / "custom_components" / "intesisbox" / "intesisbox.py",
@@ -272,6 +281,19 @@ async def test_reconnect_does_not_duplicate_pollers(port):
                 break
         assert box.is_connected
         assert box.is_initialized
+
+        # Readiness is set from inside the handshake; the reconnect task that
+        # was waiting on it retires on a later event-loop tick. Give the
+        # transient tasks a moment to finish before counting what is left,
+        # otherwise this races and fails only under a loaded suite.
+        for _ in range(20):
+            transient = {"reconnect", "init", "limits_grace"}
+            if not any(
+                name in transient and not task.done()
+                for name, task in box._tasks.items()
+            ):
+                break
+            await asyncio.sleep(0.1)
 
         live = [name for name, task in box._tasks.items() if not task.done()]
         assert sorted(live) == ["keepalive", "poll_ambtemp", "poll_status", "writer"]
