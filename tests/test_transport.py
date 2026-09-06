@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,6 +30,7 @@ _SPEC = importlib.util.spec_from_file_location(
     "intesisbox",
     Path(__file__).parent.parent / "custom_components" / "intesisbox" / "intesisbox.py",
 )
+assert _SPEC is not None and _SPEC.loader is not None
 intesisbox = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(intesisbox)
 
@@ -48,7 +50,7 @@ def port(server):
     return server.sockets[0].getsockname()[1]
 
 
-async def _connected_box(port: int) -> intesisbox.IntesisBox:
+async def _connected_box(port: int) -> Any:
     box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
     assert await box.async_connect(timeout=15)
     return box
