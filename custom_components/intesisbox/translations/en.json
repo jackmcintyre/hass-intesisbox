@@ -25,5 +25,20 @@
         "description": "Enter the new address of the same device. Entity ids, names and history are kept."
       }
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "fault": {
+        "name": "Fault"
+      }
+    },
+    "sensor": {
+      "fault_code": {
+        "name": "Fault code"
+      },
+      "signal_strength": {
+        "name": "Signal strength"
+      }
+    }
   }
 }

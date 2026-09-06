@@ -461,3 +461,22 @@ def test_entity_takes_its_name_from_the_device():
     assert entity.has_entity_name is True
     assert entity.name is None
     assert entity.device_info["name"] == "Study Air Con"
+
+
+# --------------------------------------------------------------------------
+# Lifecycle: subscribe on add, unsubscribe on remove, never stop the controller
+# --------------------------------------------------------------------------
+
+
+async def test_climate_subscribes_on_add_and_unsubscribes_on_remove():
+    """The controller is shared and entry-owned; the entity only listens."""
+    controller = FakeController()
+    entity = make_entity(controller)
+    assert controller._update_callbacks == []
+
+    await entity.async_added_to_hass()
+    assert controller._update_callbacks == [entity.update_callback]
+
+    entity._call_on_remove_callbacks()
+    assert controller._update_callbacks == []
+    assert controller.stopped is False
