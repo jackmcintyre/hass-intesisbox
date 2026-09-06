@@ -8,7 +8,7 @@ this integration's real modules.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -143,3 +143,13 @@ async def test_a_failed_handshake_leaves_the_entry_retrying(hass):
 
     assert entry.state is ConfigEntryState.SETUP_RETRY
     assert fake.stopped is True
+
+
+async def test_a_failed_platform_unload_keeps_the_controller_running(hass):
+    fake = FakeController()
+    entry = await _set_up(hass, fake)
+    with patch.object(
+        hass.config_entries, "async_unload_platforms", new=AsyncMock(return_value=False)
+    ):
+        assert not await hass.config_entries.async_unload(entry.entry_id)
+    assert fake.stopped is False

@@ -13,6 +13,7 @@ from typing import Any
 
 from custom_components.intesisbox.climate import IntesisBoxAC
 from homeassistant.components.climate import ClimateEntityFeature, HVACMode
+from homeassistant.components.climate.const import ATTR_HVAC_MODE
 from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.util.unit_system import METRIC_SYSTEM
 
@@ -480,3 +481,88 @@ async def test_climate_subscribes_on_add_and_unsubscribes_on_remove():
     entity._call_on_remove_callbacks()
     assert controller._update_callbacks == []
     assert controller.stopped is False
+
+
+# --------------------------------------------------------------------------
+# The rest of the entity surface
+# --------------------------------------------------------------------------
+
+
+def test_attributes_report_both_vanes_and_the_update_type():
+    controller = FakeController()
+    entity = make_entity(controller)
+    entity._vane_vertical = "3"
+    entity._vane_horizontal = "swing"
+    attrs = entity.extra_state_attributes
+    assert attrs["vertical_swing"] == "3"
+    assert attrs["horizontal_swing"] == "swing"
+    assert attrs["ha_update_type"] == "push"
+    controller.is_connected = False
+    assert entity.extra_state_attributes["ha_update_type"] == "poll"
+
+
+async def test_set_temperature_with_a_mode_sets_the_mode_first():
+    controller = FakeController()
+    entity = make_entity(controller)
+    await entity.async_set_temperature(
+        **{ATTR_HVAC_MODE: HVACMode.COOL, ATTR_TEMPERATURE: 21.0}
+    )
+    assert controller.calls == [("mode", "COOL"), ("temperature", 21.0)]
+
+
+async def test_turn_on_and_turn_off():
+    controller = FakeController()
+    entity = make_entity(controller)
+    await entity.async_turn_on()
+    await entity.async_turn_off()
+    assert controller.calls == [("power", "ON"), ("power", "OFF")]
+
+
+async def test_set_fan_mode_maps_to_the_device_speed():
+    controller = FakeController()
+    entity = make_entity(controller)
+    await entity.async_set_fan_mode("medium")
+    await entity.async_set_fan_mode("auto")
+    assert controller.calls == [("fan_speed", "2"), ("fan_speed", "AUTO")]
+
+
+def test_icon_and_hvac_mode_follow_power_and_mode():
+    entity = make_entity()
+    entity._current_operation = HVACMode.HEAT
+    entity._power = False
+    assert entity.hvac_mode == HVACMode.OFF
+    assert entity.icon is None
+    entity._power = True
+    assert entity.hvac_mode == HVACMode.HEAT
+    assert entity.icon == "mdi:white-balance-sunny"
+
+
+def test_limits_and_assumed_state():
+    entity = make_entity(FakeController(connected=False))
+    assert entity.min_temp == 18.0
+    assert entity.max_temp == 29.0
+    assert entity.assumed_state is True
+
+
+def test_update_callback_writes_only_once_the_entity_exists():
+    entity = make_entity()
+    forced: list[bool] = []
+    entity.schedule_update_ha_state = lambda force=False: forced.append(force)  # type: ignore[method-assign]
+    entity.entity_id = None
+    entity.update_callback()
+    assert forced == []
+    entity.entity_id = "climate.study"
+    entity.update_callback()
+    assert forced == [True]
+
+
+async def test_update_logs_connection_changes(caplog):
+    controller = FakeController(connected=True)
+    entity = make_entity(controller)
+    controller.is_connected = False
+    with caplog.at_level(logging.INFO):
+        await entity.async_update()
+        controller.is_connected = True
+        await entity.async_update()
+    assert "Lost connection" in caplog.text
+    assert "restored" in caplog.text

@@ -194,3 +194,47 @@ async def test_reconfigure_does_not_steal_another_entry_identity(hass):
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
     assert orphan.unique_id is None
+
+
+# --------------------------------------------------------------------------
+# The one place the flow touches the network, and the unexpected-error branch
+# --------------------------------------------------------------------------
+
+
+async def test_identify_returns_the_mac_and_always_closes_its_socket(hass):
+    from custom_components.intesisbox import config_flow
+
+    class FakeBox:
+        instances: list = []
+        ok = True
+        device_mac_address = MAC
+
+        def __init__(self, host, loop=None):
+            self.stopped = False
+            FakeBox.instances.append(self)
+
+        async def async_connect(self, timeout=30):
+            return FakeBox.ok
+
+        def stop(self):
+            self.stopped = True
+
+    with patch.object(config_flow, "IntesisBox", FakeBox):
+        assert await config_flow._async_identify(hass, "a-host") == MAC
+        FakeBox.ok = False
+        assert await config_flow._async_identify(hass, "a-host") is None
+    assert len(FakeBox.instances) == 2
+    assert all(box.stopped for box in FakeBox.instances)
+
+
+async def test_user_flow_reports_an_unexpected_error(hass):
+    result = await _start_user_flow(hass)
+    with patch(
+        "custom_components.intesisbox.config_flow._async_identify",
+        side_effect=RuntimeError("boom"),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_HOST: "x"}
+        )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "unknown"}
