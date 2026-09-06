@@ -76,6 +76,9 @@ class FakeController:
 
         self.calls: list[tuple[str, object]] = []
         self._update_callbacks = []
+        self.connect_timeouts: list[float] = []
+        self.connect_result = True
+        self.stopped = False
 
         # Mirrors the real controller's learned read-only latch, so the
         # entity-layer consequences of a refused vane write are testable.
@@ -98,6 +101,22 @@ class FakeController:
     def remove_update_callback(self, method):
         """Forget the entity's callback."""
         self._update_callbacks.remove(method)
+
+    # -- lifecycle, for tests that set up a config entry end-to-end --------
+
+    async def async_connect(self, timeout: float = 30) -> bool:
+        """Pretend to complete the handshake."""
+        self.connect_timeouts.append(timeout)
+        return self.connect_result
+
+    def stop(self) -> None:
+        """Record the shutdown."""
+        self.stopped = True
+
+    def push(self) -> None:
+        """Fire every registered update callback, as the device would."""
+        for method in list(self._update_callbacks):
+            method()
 
     async def async_set_temperature(self, value):
         """Record a set point write."""
