@@ -24,6 +24,7 @@ def _real_sockets(socket_enabled):
     by default; this opts the transport tests back in.
     """
 
+
 _SPEC = importlib.util.spec_from_file_location(
     "intesisbox",
     Path(__file__).parent.parent / "custom_components" / "intesisbox" / "intesisbox.py",

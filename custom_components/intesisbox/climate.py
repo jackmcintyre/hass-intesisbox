@@ -17,7 +17,7 @@ from homeassistant.components.climate.const import ATTR_HVAC_MODE
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 
 from . import DOMAIN, IntesisBoxConfigEntry
-from .intesisbox import IntesisBox, MODES
+from .intesisbox import MODES, IntesisBox
 
 _LOGGER = logging.getLogger(__name__)
 

@@ -111,7 +111,9 @@ async def test_losing_the_socket_makes_the_entities_unavailable(hass):
     await hass.async_block_till_done()
 
     assert hass.states.get("climate.study_air_con").state == STATE_UNAVAILABLE
-    assert hass.states.get("binary_sensor.study_air_con_fault").state == STATE_UNAVAILABLE
+    assert (
+        hass.states.get("binary_sensor.study_air_con_fault").state == STATE_UNAVAILABLE
+    )
 
 
 async def test_unload_stops_the_controller(hass):

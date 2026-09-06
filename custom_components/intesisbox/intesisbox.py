@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import contextlib
 import logging
 from typing import Any
 
@@ -941,7 +942,7 @@ class IntesisBox(asyncio.Protocol):
     # ------------------------------------------------------------------
 
     def diagnostics(self) -> dict[str, Any]:
-        """A snapshot for a bug report: identity, capabilities, state, tasks.
+        """Return a snapshot for a bug report: identity, capabilities, state, tasks.
 
         Everything here had to be extracted by hand from debug logs while
         diagnosing earlier issues. Identifying fields are redacted by the
@@ -998,10 +999,8 @@ class IntesisBox(asyncio.Protocol):
 
     def remove_update_callback(self, method):
         """Stop notifying a subscriber, e.g. an entity being removed."""
-        try:
+        with contextlib.suppress(ValueError):
             self._updateCallbacks.remove(method)
-        except ValueError:
-            pass
 
     def add_error_callback(self, method):
         """Public method to add a callback subscriber."""

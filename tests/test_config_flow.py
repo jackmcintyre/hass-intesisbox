@@ -156,7 +156,9 @@ async def test_reconfigure_refuses_a_different_device(hass):
 
 async def test_reconfigure_adopts_an_identity_for_a_never_connected_entry(hass):
     """An entry that never finished a handshake has no MAC yet; it gains one."""
-    entry = MockConfigEntry(domain=DOMAIN, unique_id=None, data={CONF_HOST: "192.0.2.1"})
+    entry = MockConfigEntry(
+        domain=DOMAIN, unique_id=None, data={CONF_HOST: "192.0.2.1"}
+    )
     entry.add_to_hass(hass)
 
     result = await entry.start_reconfigure_flow(hass)
@@ -174,9 +176,13 @@ async def test_reconfigure_adopts_an_identity_for_a_never_connected_entry(hass):
 
 async def test_reconfigure_does_not_steal_another_entry_identity(hass):
     """A never-connected entry cannot be pointed at a box another entry owns."""
-    owner = MockConfigEntry(domain=DOMAIN, unique_id=MAC, data={CONF_HOST: "192.168.1.50"})
+    owner = MockConfigEntry(
+        domain=DOMAIN, unique_id=MAC, data={CONF_HOST: "192.168.1.50"}
+    )
     owner.add_to_hass(hass)
-    orphan = MockConfigEntry(domain=DOMAIN, unique_id=None, data={CONF_HOST: "192.0.2.1"})
+    orphan = MockConfigEntry(
+        domain=DOMAIN, unique_id=None, data={CONF_HOST: "192.0.2.1"}
+    )
     orphan.add_to_hass(hass)
 
     result = await orphan.start_reconfigure_flow(hass)
