@@ -15,6 +15,16 @@ import pytest
 
 from .emulator import ID_V6, Emulator, start
 
+
+@pytest.fixture(autouse=True)
+def _real_sockets(socket_enabled):
+    """The emulator is a real TCP server on 127.0.0.1.
+
+    The Home Assistant test harness blocks socket construction for every test
+    by default; this opts the transport tests back in.
+    """
+
+
 _SPEC = importlib.util.spec_from_file_location(
     "intesisbox",
     Path(__file__).parent.parent / "custom_components" / "intesisbox" / "intesisbox.py",
@@ -273,6 +283,19 @@ async def test_reconnect_does_not_duplicate_pollers(port):
         assert box.is_connected
         assert box.is_initialized
 
+        # Readiness is set from inside the handshake; the reconnect task that
+        # was waiting on it retires on a later event-loop tick. Give the
+        # transient tasks a moment to finish before counting what is left,
+        # otherwise this races and fails only under a loaded suite.
+        for _ in range(20):
+            transient = {"reconnect", "init", "limits_grace"}
+            if not any(
+                name in transient and not task.done()
+                for name, task in box._tasks.items()
+            ):
+                break
+            await asyncio.sleep(0.1)
+
         live = [name for name, task in box._tasks.items() if not task.done()]
         assert sorted(live) == ["keepalive", "poll_ambtemp", "poll_status", "writer"]
     finally:
@@ -303,3 +326,41 @@ async def test_stop_cancels_all_tasks(port):
     await asyncio.sleep(0.5)
     assert all(task.done() for task in box._tasks.values())
     assert not box.is_connected
+
+
+# --------------------------------------------------------------------------
+# #14 - the diagnostic channel
+# --------------------------------------------------------------------------
+
+
+def test_pong_carries_live_rssi():
+    """PONG:<rssi> is not in the spec but real gateways send it; keep it."""
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    pushes = []
+    box.add_update_callback(lambda: pushes.append(True))
+    box.data_received(b"PONG:-54\r\n")
+    assert box.rssi == "-54"
+    assert pushes, "a fresh RSSI must reach the entities"
+    # A bare PONG is a keepalive answer and nothing more.
+    box.data_received(b"PONG\r\n")
+    assert box.rssi == "-54"
+
+
+def test_fault_status_and_code_are_readable():
+    """ERRSTATUS and ERRCODE were stored and read by nothing."""
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    assert box.error_status is None
+    box.data_received(b"CHN,1:ERRSTATUS,ERR\r\nCHN,1:ERRCODE,E7\r\n")
+    assert box.error_status == "ERR"
+    assert box.error_code == "E7"
+
+
+def test_removed_update_callback_is_not_called():
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    calls = []
+    cb = lambda: calls.append(True)  # noqa: E731
+    box.add_update_callback(cb)
+    box.remove_update_callback(cb)
+    box.remove_update_callback(cb)  # tolerated
+    box.data_received(b"CHN,1:MODE,HEAT\r\n")
+    assert not calls

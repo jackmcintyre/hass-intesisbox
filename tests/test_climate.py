@@ -69,8 +69,16 @@ class FakeController:
         self.horizontal_swing = None
         self.is_on = False
 
+        # Diagnostic channel, as a healthy unit reports it.
+        self.error_status = "OK"
+        self.error_code = "0"
+        self.rssi = "-54"
+
         self.calls: list[tuple[str, object]] = []
         self._update_callbacks = []
+        self.connect_timeouts: list[float] = []
+        self.connect_result = True
+        self.stopped = False
 
         # Mirrors the real controller's learned read-only latch, so the
         # entity-layer consequences of a refused vane write are testable.
@@ -89,6 +97,26 @@ class FakeController:
     def add_update_callback(self, method):
         """Record the entity's callback."""
         self._update_callbacks.append(method)
+
+    def remove_update_callback(self, method):
+        """Forget the entity's callback."""
+        self._update_callbacks.remove(method)
+
+    # -- lifecycle, for tests that set up a config entry end-to-end --------
+
+    async def async_connect(self, timeout: float = 30) -> bool:
+        """Pretend to complete the handshake."""
+        self.connect_timeouts.append(timeout)
+        return self.connect_result
+
+    def stop(self) -> None:
+        """Record the shutdown."""
+        self.stopped = True
+
+    def push(self) -> None:
+        """Fire every registered update callback, as the device would."""
+        for method in list(self._update_callbacks):
+            method()
 
     async def async_set_temperature(self, value):
         """Record a set point write."""
@@ -405,3 +433,29 @@ def test_unavailable_when_controller_disconnected():
 def test_entity_does_not_poll():
     """The controller pushes changes, so Home Assistant should not poll."""
     assert make_entity().should_poll is False
+
+
+def test_yaml_platform_is_gone():
+    """Config entries only: a YAML platform opened a second socket to a box
+    that may already have one, and a WMP device only allows two."""
+    from custom_components.intesisbox import climate
+
+    assert not hasattr(climate, "async_setup_platform")
+    assert not hasattr(climate, "PLATFORM_SCHEMA")
+
+
+# --------------------------------------------------------------------------
+# Naming
+# --------------------------------------------------------------------------
+
+
+def test_entity_takes_its_name_from_the_device():
+    """With has_entity_name the device carries the name and the entity has none.
+
+    Previously a config-entry install named the entity after the MAC address
+    until the user renamed it.
+    """
+    entity = make_entity(FakeController(), name="Study Air Con")
+    assert entity.has_entity_name is True
+    assert entity.name is None
+    assert entity.device_info["name"] == "Study Air Con"

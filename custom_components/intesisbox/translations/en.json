@@ -1,7 +1,9 @@
 {
   "config": {
     "abort": {
-      "already_configured": "Device is already configured"
+      "already_configured": "Device is already configured",
+      "reconfigure_successful": "Re-configuration was successful",
+      "unique_id_mismatch": "That address belongs to a different device"
     },
     "error": {
       "cannot_connect": "Failed to connect",
@@ -14,6 +16,13 @@
         },
         "title": "IntesisBox",
         "description": "Integration for Intesis Home Automation Interface devices supporting the WMP protocol over the local network"
+      },
+      "reconfigure": {
+        "data": {
+          "host": "Host"
+        },
+        "title": "Change device address",
+        "description": "Enter the new address of the same device. Entity ids, names and history are kept."
       }
     }
   }

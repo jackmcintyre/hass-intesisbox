@@ -1,12 +1,13 @@
 {
   "domain": "intesisbox",
   "name": "IntesisBox",
-  "version": "2.3.2",
+  "version": "2.4.0",
   "documentation": "https://github.com/jackmcintyre/hass-intesisbox",
   "issue_tracker": "https://github.com/jackmcintyre/hass-intesisbox/issues",
   "dependencies": [],
   "codeowners": ["@jnimmo"],
   "config_flow": true,
   "requirements": [],
-  "iot_class": "local_push"
+  "iot_class": "local_push",
+  "integration_type": "device"
 }
