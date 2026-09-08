@@ -46,6 +46,8 @@ class Emulator(asyncio.Protocol):
     id_banner = ID_GEN1
     #: Accept the connection and answer nothing at all.
     silent = False
+    #: Answer the next SET with ERR instead of ACK.
+    reject_next_set = False
     #: Live connections, so a test can drop them.
     connections: list[Emulator] = []
 
@@ -53,6 +55,8 @@ class Emulator(asyncio.Protocol):
         """Start with a fresh copy of the default device state."""
         self.state = dict(DEFAULT_STATE)
         self.buffer = b""
+        #: Every command line received, in order, so tests can check ordering.
+        self.received: list[str] = []
 
     @classmethod
     def reset(cls) -> None:
@@ -60,6 +64,7 @@ class Emulator(asyncio.Protocol):
         cls.tear_frames = False
         cls.id_banner = ID_GEN1
         cls.silent = False
+        cls.reject_next_set = False
         cls.connections = []
 
     @classmethod
@@ -122,6 +127,7 @@ class Emulator(asyncio.Protocol):
 
     def handle(self, line: str) -> None:
         """Respond to one command."""
+        self.received.append(line)
         if Emulator.silent:
             return
         head = line.split(",")[0]
@@ -144,6 +150,10 @@ class Emulator(asyncio.Protocol):
             else:
                 self.send("ERR\r\n")
         elif head == "SET":
+            if Emulator.reject_next_set:
+                Emulator.reject_next_set = False
+                self.send("ERR\r\n")
+                return
             payload = line.split(":", 1)[1]
             function, value = payload.split(",", 1)
             if function not in RW_FUNCTIONS:

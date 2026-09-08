@@ -84,8 +84,11 @@ async def _connect_and_handshake(port: int) -> Any:
     """Connect to the emulator and wait for the handshake to finish."""
     box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
     box.connect()
-    # LIMITS:VANELR is the last query the controller sends on connect.
-    await _wait_until(lambda: bool(box.vane_horizontal_list))
+    # LIMITS:VANELR is the last query the controller sends on connect, and the
+    # status dump requested on ID follows it.
+    await _wait_until(
+        lambda: bool(box.vane_horizontal_list) and box.ambient_temperature is not None
+    )
     return box
 
 
@@ -274,6 +277,7 @@ def _live_tasks(box: Any) -> list[str]:
 
 async def test_periodic_tasks_send_keepalive_and_polls(monkeypatch):
     """PING must actually go out, alongside the status and temperature polls."""
+    monkeypatch.setattr(intesisbox, "COMMAND_INTERVAL", 0.01)
     monkeypatch.setattr(intesisbox, "KEEPALIVE_INTERVAL", 0.05)
     monkeypatch.setattr(intesisbox, "AMBTEMP_POLL_INTERVAL", 0.05)
     box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
@@ -301,7 +305,12 @@ async def test_reconnect_does_not_duplicate_pollers(port):
         await _wait_until(
             lambda: not {"reconnect", "init"} & set(_live_tasks(box)), timeout=15
         )
-        assert _live_tasks(box) == ["keepalive", "poll_ambtemp", "poll_status"]
+        assert _live_tasks(box) == [
+            "keepalive",
+            "poll_ambtemp",
+            "poll_status",
+            "writer",
+        ]
     finally:
         await _shutdown(box)
 
@@ -438,3 +447,199 @@ async def test_stop_cancels_a_connect_still_in_flight(monkeypatch, port):
     assert not box.is_connected
     assert Emulator.connections == []
     await _reap_tasks()
+
+
+# --------------------------------------------------------------------------
+# Serialised writes, ACK and ERR
+# --------------------------------------------------------------------------
+
+
+async def test_set_mode_confirms_before_power_on(port):
+    """Mode is confirmed from the device's own push, not by polling 30 times."""
+    box = await _connect_and_handshake(port)
+    try:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await box.async_set_mode("HEAT")
+        await asyncio.sleep(1.5)
+        device = Emulator.connections[0]
+        assert device.state["MODE"] == "HEAT"
+        assert device.state["ONOFF"] == "ON"
+        assert loop.time() - started < 5
+    finally:
+        await _shutdown(box)
+
+
+async def test_err_response_surfaces_to_callback(port):
+    """A rejected command must not fail silently."""
+    box = await _connect_and_handshake(port)
+    errors: list[str] = []
+    box.add_error_callback(errors.append)
+    try:
+        Emulator.reject_next_set = True
+        await box.async_set_temperature(21.0)
+        await asyncio.sleep(1.5)
+        assert errors == ["Device rejected SET,1:SETPTEMP,210"]
+    finally:
+        await _shutdown(box)
+
+
+async def test_sync_setters_work_from_an_executor_thread(port):
+    """The entity calls set_* from a worker thread; the write lands on the loop.
+
+    From a worker thread each call also waits for its command to complete,
+    so a caller that issues set_mode then set_temperature, as the climate
+    entity does, gets them applied in that order.
+    """
+    box = await _connect_and_handshake(port)
+    try:
+        loop = asyncio.get_running_loop()
+        device = Emulator.connections[0]
+
+        def from_thread():
+            box.set_mode("HEAT")
+            # Returned only once the device confirmed the mode and the power-on
+            # was queued, so what follows lands after it.
+            assert device.state["MODE"] == "HEAT"
+            box.set_temperature(22.5)
+            box.set_fan_speed("2")
+
+        await loop.run_in_executor(None, from_thread)
+        await asyncio.sleep(1.0)
+        assert device.state["ONOFF"] == "ON"
+        assert device.state["SETPTEMP"] == "225"
+        assert device.state["FANSP"] == "2"
+        sets = [c for c in device.received if c.startswith("SET,")]
+        assert sets == [
+            "SET,1:MODE,HEAT",
+            "SET,1:ONOFF,ON",
+            "SET,1:SETPTEMP,225",
+            "SET,1:FANSP,2",
+        ]
+    finally:
+        await _shutdown(box)
+
+
+async def test_sync_setters_only_schedule_when_called_on_the_loop():
+    """On the loop thread there is nothing to block on; the command is queued."""
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
+    box.set_power_off()
+    await asyncio.sleep(0.05)
+    assert box._write_queue.get_nowait() == "SET,1:ONOFF,OFF"
+
+
+async def test_unanswered_set_releases_the_writer(monkeypatch, caplog):
+    monkeypatch.setattr(intesisbox, "SET_REPLY_TIMEOUT", 0.1)
+    monkeypatch.setattr(intesisbox, "COMMAND_INTERVAL", 0.01)
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
+    transport = FakeTransport()
+    box.connection_made(transport)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="intesisbox"):
+            await box.async_set_power_off()
+            await box.async_set_horizontal_vane("1")
+            await asyncio.sleep(0.8)
+        assert b"SET,1:ONOFF,OFF\r" in transport.written
+        assert b"SET,1:VANELR,1\r" in transport.written, "queue must move on"
+        assert "No reply" in caplog.text
+    finally:
+        await _shutdown(box)
+
+
+async def test_a_set_waits_for_the_previous_reply(monkeypatch):
+    """Two SETs back to back: the second is not written until the first is answered."""
+    monkeypatch.setattr(intesisbox, "COMMAND_INTERVAL", 0.01)
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
+    transport = FakeTransport()
+    box.connection_made(transport)
+    try:
+        await box.async_set_power_on()
+        await box.async_set_fan_speed("3")
+        await asyncio.sleep(0.2)
+        assert transport.written.count(b"SET,1:ONOFF,ON\r") == 1
+        assert b"SET,1:FANSP,3\r" not in transport.written
+        box.data_received(b"ACK\r\n")
+        await asyncio.sleep(0.2)
+        assert b"SET,1:FANSP,3\r" in transport.written
+    finally:
+        await _shutdown(box)
+
+
+async def test_change_waiters_time_out_and_fail_on_disconnect():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    assert await box._wait_for_value("MODE", "HEAT", timeout=0.05) is False
+    assert box._change_waiters == []
+
+    waiting = loop.create_task(box._wait_for_value("MODE", "HEAT", timeout=5))
+    await asyncio.sleep(0)
+    box._fail_change_waiters(ConnectionResetError("dropped"))
+    assert await waiting is False
+
+
+async def test_set_mode_edge_cases(caplog):
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    with caplog.at_level(logging.WARNING):
+        await box.async_set_mode("WIBBLE")
+    assert "unsupported mode" in caplog.text
+    assert box._write_queue.empty()
+
+    box.data_received(b"CHN,1:ONOFF,ON\r\n")
+    await box.async_set_mode("HEAT")  # already on: no confirm-then-power-on
+    assert box._write_queue.get_nowait() == "SET,1:MODE,HEAT"
+    assert box._write_queue.empty()
+
+    box.data_received(b"CHN,1:ONOFF,OFF\r\n")
+
+    async def never(*a, **k):
+        return False
+
+    box._wait_for_value = never  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        await box.async_set_mode("COOL")
+    assert "did not confirm mode" in caplog.text
+
+
+async def test_writer_survives_a_failing_transport(caplog):
+    class FailingTransport(FakeTransport):
+        def write(self, data: bytes) -> None:
+            raise OSError("socket went away")
+
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
+    with caplog.at_level(logging.ERROR):
+        box.connection_made(FailingTransport())
+        await asyncio.sleep(0.1)
+    try:
+        assert "Failed to send" in caplog.text
+        assert not box._tasks["writer"].done(), "one bad write must not kill the writer"
+        # Failures are still paced: the seven handshake commands need well
+        # over a second at the default interval, so not all have been tried.
+        assert caplog.text.count("Failed to send") < 7
+    finally:
+        await _shutdown(box)
+
+
+async def test_stale_commands_are_dropped_on_reconnect():
+    """Anything queued while disconnected refers to a dead socket."""
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
+    await box._send("STALE")
+    transport = FakeTransport()
+    box.connection_made(transport)
+    await asyncio.sleep(0.05)
+    try:
+        assert b"STALE\r" not in transport.written
+        assert transport.written[0] == b"ID\r"
+    finally:
+        await _shutdown(box)
+
+
+def test_bare_err_with_nothing_outstanding_is_logged(caplog):
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    errors: list[str] = []
+    box.add_error_callback(errors.append)
+    with caplog.at_level(logging.WARNING):
+        box.data_received(b"ERR\r\n")
+    assert "rejected a command" in caplog.text
+    assert errors == ["Device rejected a command"]
+    assert box.error_message == "Device rejected a command"

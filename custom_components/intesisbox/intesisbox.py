@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import contextlib
 import logging
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,6 +59,23 @@ RECONNECT_MAX_DELAY = 60
 # closed and the reconnect backoff grows.
 CONNECT_TIMEOUT = 15
 
+# Gap between successive commands. The spec says commands cannot be batched
+# but sets no minimum spacing on an established connection; the one second
+# rule is about opening and closing sockets.
+COMMAND_INTERVAL = 0.2
+
+# How long a SET may go unanswered before the writer stops holding it for
+# attribution. Devices answer in tens of milliseconds; after this the reply is
+# treated as lost and a later ERR is no longer blamed on the command.
+SET_REPLY_TIMEOUT = 2.0
+
+# How long to wait for the device to confirm a mode change before giving up.
+CONFIRM_TIMEOUT = 10
+
+# How long a synchronous caller on a worker thread waits for its command to
+# complete: a mode change can take the confirm timeout plus two SET replies.
+COMMAND_WAIT_TIMEOUT = CONFIRM_TIMEOUT + 2 * SET_REPLY_TIMEOUT + 1
+
 background_tasks = set()
 
 
@@ -68,6 +86,14 @@ def clean_background_task(task):
         return
     if exc := task.exception():
         _LOGGER.error("Background task failed: %r", exc)
+
+
+def _log_command_failure(future) -> None:
+    """Report a command scheduled from another thread that raised."""
+    if future.cancelled():
+        return
+    if exc := future.exception():
+        _LOGGER.error("Command failed: %r", exc)
 
 
 def ensure_background_task(coro, loop):
@@ -113,6 +139,21 @@ class IntesisBox(asyncio.Protocol):
         # task being cancelled and restarted by connection_lost.
         self._reconnect_delay = RECONNECT_MIN_DELAY
 
+        # Outbound commands are serialised through a queue drained by a single
+        # writer task, so every write happens on the event loop thread and no
+        # two callers can interleave.
+        self._write_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        # The SET currently awaiting its ACK or ERR. The writer holds the next
+        # command until this resolves, so at most one SET is ever outstanding
+        # and a bare ERR can be attributed to it.
+        self._outstanding_set: str | None = None
+        self._set_replied = asyncio.Event()
+
+        # Waiters for a function reaching a value, used to confirm a change
+        # from the device's own push instead of polling for it.
+        self._change_waiters: list[tuple[str, str | None, asyncio.Future]] = []
+
         # Limits
         self._operation_list: list[str] = []
         self._fan_speed_list: list[str] = []
@@ -156,6 +197,13 @@ class IntesisBox(asyncio.Protocol):
         self._buffer = b""
         self._connectionStatus = API_CONNECTING
         self._connected.clear()
+        self._outstanding_set = None
+
+        # Drain anything queued while disconnected; it refers to a dead socket.
+        while not self._write_queue.empty():
+            self._write_queue.get_nowait()
+
+        self._start_task("writer", self._writer())
         self._start_task("init", self.query_initial_state())
 
     def _become_connected(self) -> None:
@@ -194,6 +242,7 @@ class IntesisBox(asyncio.Protocol):
         self._transport = None
         self._connected.clear()
         self._cancel_all_tasks()
+        self._fail_change_waiters(ConnectionResetError("Connection lost"))
         self._send_update_callback()
 
         if not self._stopped:
@@ -324,6 +373,7 @@ class IntesisBox(asyncio.Protocol):
         self._connectionStatus = API_DISCONNECTED
         self._connected.clear()
         self._cancel_all_tasks()
+        self._fail_change_waiters(ConnectionResetError("Stopped"))
         self._close_transport()
         self._transport = None
 
@@ -331,27 +381,57 @@ class IntesisBox(asyncio.Protocol):
     # Outbound commands
     # ------------------------------------------------------------------
 
+    async def _writer(self) -> None:
+        """Drain the write queue, one command at a time, on the event loop."""
+        while True:
+            cmd = await self._write_queue.get()
+            try:
+                self._write(cmd)
+            except Exception as exc:
+                # Surface it and carry on: one bad write must not kill the
+                # writer, or nothing would ever be sent again. Keep the
+                # spacing even so; a failing socket is no reason to batch.
+                _LOGGER.error("Failed to send %r: %r", cmd, exc)
+                await asyncio.sleep(COMMAND_INTERVAL)
+                continue
+            if cmd.startswith("SET,"):
+                # Hold the queue until the device answers this SET, so at most
+                # one is outstanding and a bare ERR is unambiguously its reply.
+                self._outstanding_set = cmd
+                self._set_replied.clear()
+                try:
+                    async with asyncio.timeout(SET_REPLY_TIMEOUT):
+                        await self._set_replied.wait()
+                except TimeoutError:
+                    _LOGGER.debug("No reply to %r within %ss", cmd, SET_REPLY_TIMEOUT)
+                self._outstanding_set = None
+            await asyncio.sleep(COMMAND_INTERVAL)
+
+    async def _send(self, cmd: str) -> None:
+        """Queue a command for the writer."""
+        await self._write_queue.put(cmd)
+
     async def keep_alive(self):
         """Send PING periodically to reset the device's watchdog timer."""
         while True:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             _LOGGER.debug("Sending keepalive")
-            self._write("PING")
+            await self._send("PING")
 
     async def poll_status(self):
         """Periodically request a full status refresh."""
         while True:
-            self._write("GET,1:*")
+            await self._send("GET,1:*")
             await asyncio.sleep(STATUS_POLL_INTERVAL)
 
     async def poll_ambtemp(self):
         """Periodically refresh the ambient temperature."""
         while True:
             await asyncio.sleep(AMBTEMP_POLL_INTERVAL)
-            self._write(f"GET,1:{FUNCTION_AMBTEMP}")
+            await self._send(f"GET,1:{FUNCTION_AMBTEMP}")
 
     async def query_initial_state(self):
-        """Fetch configuration from the device upon connection."""
+        """Fetch identification and limits from the device upon connection."""
         cmds = [
             "ID",
             "LIMITS:SETPTEMP",
@@ -361,8 +441,7 @@ class IntesisBox(asyncio.Protocol):
             "LIMITS:VANELR",
         ]
         for cmd in cmds:
-            self._write(cmd)
-            await asyncio.sleep(1)
+            await self._send(cmd)
 
     def _write(self, cmd):
         transport = self._transport
@@ -371,11 +450,6 @@ class IntesisBox(asyncio.Protocol):
             return
         transport.write(f"{cmd}\r".encode("ascii"))
         _LOGGER.debug("Data sent: %r", cmd)
-
-    async def _writeasync(self, cmd):
-        """Async write to slow down commands and await response from units."""
-        self._write(cmd)
-        await asyncio.sleep(1)
 
     def data_received(self, data: bytes):
         """Asyncio callback when data is received on the socket.
@@ -415,6 +489,16 @@ class IntesisBox(asyncio.Protocol):
     def _process_line(self, line: str) -> bool:
         """Handle one complete line. Returns True if the device state changed."""
         _LOGGER.debug("Data received: %r", line)
+
+        if line == "ACK":
+            # The outstanding SET was accepted; release the writer.
+            if self._outstanding_set is not None:
+                self._outstanding_set = None
+                self._set_replied.set()
+            return False
+        if line == "ERR":
+            return self._handle_error_response()
+
         cmdList = line.split(":", 1)
         if len(cmdList) < 2:
             return False
@@ -427,6 +511,26 @@ class IntesisBox(asyncio.Protocol):
             return self._parse_change_received(args)
         if cmd == "LIMITS":
             return self._parse_limits_received(args)
+        return False
+
+    def _handle_error_response(self) -> bool:
+        """Attribute a bare ERR to the SET awaiting its reply, if any.
+
+        The spec returns a bare ERR for an invalid value or a write to a
+        read-only function, with no indication of which command failed. The
+        writer holds the queue while a SET awaits its reply, so the
+        outstanding SET, if any, is the culprit.
+        """
+        recent = self._outstanding_set
+        if recent is not None:
+            self._outstanding_set = None
+            self._set_replied.set()
+
+        if recent:
+            _LOGGER.warning("IntesisBox %s rejected %r", self._ip, recent)
+        else:
+            _LOGGER.warning("IntesisBox %s rejected a command", self._ip)
+        self._send_error_callback(f"Device rejected {recent or 'a command'}")
         return False
 
     def _parse_id_received(self, args) -> bool:
@@ -474,6 +578,7 @@ class IntesisBox(asyncio.Protocol):
         self._device[function] = value
 
         _LOGGER.debug(f"Updated state: {self._device!r}")
+        self._resolve_change_waiters(function, value)
         return True
 
     def _parse_limits_received(self, args) -> bool:
@@ -515,66 +620,157 @@ class IntesisBox(asyncio.Protocol):
         )
         return True
 
+    # ------------------------------------------------------------------
+    # Change confirmation
+    # ------------------------------------------------------------------
+
+    def _resolve_change_waiters(self, function: str, value: str | None) -> None:
+        """Wake anyone waiting for this function to reach this value."""
+        for waiter in list(self._change_waiters):
+            wanted_function, wanted_value, future = waiter
+            if wanted_function == function and wanted_value == value:
+                self._change_waiters.remove(waiter)
+                if not future.done():
+                    future.set_result(True)
+
+    def _fail_change_waiters(self, exc: Exception) -> None:
+        """Fail every outstanding waiter, e.g. because the socket dropped."""
+        for _, _, future in self._change_waiters:
+            if not future.done():
+                future.set_exception(exc)
+        self._change_waiters.clear()
+
+    async def _wait_for_value(
+        self, function: str, value: str, timeout: float = CONFIRM_TIMEOUT
+    ) -> bool:
+        """Wait for a function to report a value, using the device's own push.
+
+        Returns True on confirmation, False on timeout. The spec sends a CHN
+        message whenever a value actually changes, so this replaces polling
+        the device for it.
+        """
+        if self._device.get(function) == value:
+            return True
+        future: asyncio.Future = self._eventLoop.create_future()
+        waiter = (function, value, future)
+        self._change_waiters.append(waiter)
+        try:
+            async with asyncio.timeout(timeout):
+                await future
+        except TimeoutError:
+            if waiter in self._change_waiters:
+                self._change_waiters.remove(waiter)
+            return False
+        except ConnectionResetError:
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Public control surface
+    # ------------------------------------------------------------------
+
+    async def async_set_temperature(self, setpoint: float) -> None:
+        """Set the target temperature."""
+        await self._set_value(FUNCTION_SETPOINT, round(setpoint * 10))
+
+    async def async_set_fan_speed(self, fan_speed: str) -> None:
+        """Set the fan speed."""
+        await self._set_value(FUNCTION_FANSP, fan_speed)
+
+    async def async_set_vertical_vane(self, vane: str) -> None:
+        """Set the vertical vane."""
+        await self._set_value(FUNCTION_VANEUD, vane)
+
+    async def async_set_horizontal_vane(self, vane: str) -> None:
+        """Set the horizontal vane."""
+        await self._set_value(FUNCTION_VANELR, vane)
+
+    async def async_set_power_off(self) -> None:
+        """Turn the device off."""
+        await self._set_value(FUNCTION_ONOFF, POWER_OFF)
+
+    async def async_set_power_on(self) -> None:
+        """Turn the device on."""
+        await self._set_value(FUNCTION_ONOFF, POWER_ON)
+
+    async def async_set_mode(self, mode: str) -> None:
+        """Set the mode, confirming the change before turning the unit on.
+
+        Some units apply ONOFF and MODE out of order, so when the unit is off
+        we wait for the device to confirm the new mode before powering on.
+        """
+        if mode not in MODES:
+            _LOGGER.warning("Ignoring unsupported mode %r", mode)
+            return
+
+        _LOGGER.debug("Setting MODE to %s", mode)
+        await self._set_value(FUNCTION_MODE, mode)
+
+        if self.is_on:
+            return
+
+        if await self._wait_for_value(FUNCTION_MODE, mode):
+            _LOGGER.debug("MODE confirmed as %s, powering on", mode)
+            await self.async_set_power_on()
+        else:
+            _LOGGER.error(
+                "IntesisBox %s did not confirm mode %s, not powering on",
+                self._ip,
+                mode,
+            )
+
+    async def _set_value(self, uid: str, value: str | int) -> None:
+        """Change a setting on the thermostat."""
+        await self._send(f"SET,1:{uid},{value}")
+
+    # The climate entity calls these from Home Assistant's executor thread.
+    # Each runs its async counterpart on the event loop and, from a worker
+    # thread, waits for it to finish, so the entity's next command is queued
+    # after this one completes, as it was when these methods blocked. From
+    # the loop thread itself they can only schedule, so they return at once.
+
+    def _schedule(self, coro) -> None:
+        """Run a coroutine on the event loop from any thread."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._eventLoop)
+        future.add_done_callback(_log_command_failure)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # A worker thread: wait, so callers keep their ordering.
+            with contextlib.suppress(Exception):
+                future.result(timeout=COMMAND_WAIT_TIMEOUT)
+
     def set_temperature(self, setpoint):
         """Public method for setting the temperature."""
-        set_temp = round(setpoint * 10)
-        self._set_value(FUNCTION_SETPOINT, set_temp)
+        self._schedule(self.async_set_temperature(setpoint))
 
     def set_fan_speed(self, fan_speed):
         """Public method to set the fan speed."""
-        self._set_value(FUNCTION_FANSP, fan_speed)
+        self._schedule(self.async_set_fan_speed(fan_speed))
 
     def set_vertical_vane(self, vane: str):
         """Public method to set the vertical vane."""
-        self._set_value(FUNCTION_VANEUD, vane)
+        self._schedule(self.async_set_vertical_vane(vane))
 
     def set_horizontal_vane(self, vane: str):
         """Public method to set the horizontal vane."""
-        self._set_value(FUNCTION_VANELR, vane)
-
-    def _set_value(self, uid: str, value: str | int) -> None:
-        """Change a setting on the thermostat."""
-        try:
-            asyncio.run(self._writeasync(f"SET,1:{uid},{value}"))
-        except Exception as e:
-            _LOGGER.error("%s Exception. %s / %s", type(e), e.args, e)
+        self._schedule(self.async_set_horizontal_vane(vane))
 
     def set_mode(self, mode):
-        """Send mode and confirm change before turning on."""
-        """Some units return responses out of order"""
-        _LOGGER.debug(f"Setting MODE to {mode}.")
-        if mode in MODES:
-            self._set_value(FUNCTION_MODE, mode)
-        if not self.is_on:
-            """Check to ensure in correct mode before turning on"""
-            retry = 30
-            while self.mode != mode and retry > 0:
-                _LOGGER.debug(
-                    f"Waiting for MODE to return {mode}, currently {str(self.mode)}"
-                )
-                _LOGGER.debug(f"Retry attempt = {retry}")
-                asyncio.run(self._writeasync("GET,1:MODE"))
-                retry -= 1
-            else:
-                if retry != 0:
-                    _LOGGER.debug(
-                        f"MODE confirmed now {str(self.mode)}, proceed to Power On"
-                    )
-                    self.set_power_on()
-                else:
-                    _LOGGER.error("Cannot set Intesisbox mode giving up...")
+        """Send mode and confirm the change before turning on."""
+        self._schedule(self.async_set_mode(mode))
 
     def set_mode_dry(self):
-        """Public method to set device to dry asynchronously."""
-        self._set_value(FUNCTION_MODE, MODE_DRY)
+        """Public method to set device to dry."""
+        self._schedule(self._set_value(FUNCTION_MODE, MODE_DRY))
 
     def set_power_off(self):
-        """Public method to turn off the device asynchronously."""
-        self._set_value(FUNCTION_ONOFF, POWER_OFF)
+        """Public method to turn off the device."""
+        self._schedule(self.async_set_power_off())
 
     def set_power_on(self):
-        """Public method to turn on the device asynchronously."""
-        self._set_value(FUNCTION_ONOFF, POWER_ON)
+        """Public method to turn on the device."""
+        self._schedule(self.async_set_power_on())
 
     @property
     def operation_list(self) -> list[str]:
