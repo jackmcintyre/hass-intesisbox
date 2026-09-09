@@ -77,6 +77,35 @@ CONFIRM_TIMEOUT = 10
 # complete: a mode change can take the confirm timeout plus two SET replies.
 COMMAND_WAIT_TIMEOUT = CONFIRM_TIMEOUT + 2 * SET_REPLY_TIMEOUT + 1
 
+# Commands sent on connect. ID is mandatory: without it there is no device
+# identity. The LIMITS queries are best effort: not every unit answers every
+# one (a device with no left/right vane may simply ignore LIMITS:VANELR), and
+# refusing to become ready in that case would be a worse failure than starting
+# with an incomplete picture of the device's capabilities.
+INIT_REQUIRED = ["ID"]
+# A full status dump is part of the handshake, not just the periodic poll: the
+# entity needs the device's state before it is added. Its first CHN line marks
+# STATUS as answered.
+INIT_STATUS = "STATUS"
+INIT_OPTIONAL = [
+    f"LIMITS:{FUNCTION_SETPOINT}",
+    f"LIMITS:{FUNCTION_FANSP}",
+    f"LIMITS:{FUNCTION_MODE}",
+    f"LIMITS:{FUNCTION_VANEUD}",
+    f"LIMITS:{FUNCTION_VANELR}",
+    INIT_STATUS,
+]
+INIT_AWAITED = INIT_REQUIRED + INIT_OPTIONAL
+INIT_COMMANDS = INIT_REQUIRED + INIT_OPTIONAL[:-1] + ["GET,1:*"]
+
+# Once ID has arrived, wait this long for the rest of the handshake, the LIMITS
+# replies and the status dump, before becoming ready with whatever turned up.
+LIMITS_GRACE = 5
+
+# When every awaited reply is in, the rest of the status dump is still landing
+# in the same chunk as its first line; a short settle lets it finish.
+STATUS_SETTLE = 0.2
+
 background_tasks = set()
 
 
@@ -129,8 +158,10 @@ class IntesisBox(asyncio.Protocol):
         # carry a partial line, several lines, or both.
         self._buffer = b""
 
-        # Set once the device has answered ID on the current connection.
-        self._connected = asyncio.Event()
+        # Set once the handshake on the current connection has finished: ID,
+        # the LIMITS replies that were going to arrive, and the status dump.
+        self._ready = asyncio.Event()
+        self._pending_init: set[str] = set()
 
         # Owned tasks by name, cancelled and replaced on every (re)connect.
         self._tasks: dict[str, asyncio.Task] = {}
@@ -197,7 +228,8 @@ class IntesisBox(asyncio.Protocol):
         self._transport = transport  # type: ignore[assignment]
         self._buffer = b""
         self._connectionStatus = API_CONNECTING
-        self._connected.clear()
+        self._ready.clear()
+        self._pending_init = set(INIT_AWAITED)
         self._outstanding_set = None
 
         # Drain anything queued while disconnected; it refers to a dead socket.
@@ -207,12 +239,54 @@ class IntesisBox(asyncio.Protocol):
         self._start_task("writer", self._writer())
         self._start_task("init", self.query_initial_state())
 
-    def _become_connected(self) -> None:
-        """Mark the device connected and start the periodic tasks."""
+    def _mark_init_complete(self, cmd: str) -> None:
+        """Record an answered init command and signal readiness once complete."""
+        if cmd not in self._pending_init:
+            # Not mid-handshake, or already answered: an unsolicited, late or
+            # repeated reply, which must not restart the grace timer.
+            return
+        self._pending_init.discard(cmd)
+
+        if self._ready.is_set():
+            return
+
+        if self._pending_init:
+            # Everything mandatory answered, only optional replies outstanding:
+            # start the grace timer rather than waiting indefinitely.
+            if not self._pending_init & set(INIT_REQUIRED):
+                self._start_task("limits_grace", self._limits_grace(LIMITS_GRACE))
+            return
+
+        # Every reply is in; only the status dump is still on the wire. It
+        # follows within milliseconds, so a short settle suffices here.
+        self._start_task("limits_grace", self._limits_grace(STATUS_SETTLE))
+
+    async def _limits_grace(self, delay: float) -> None:
+        """Become ready once the stragglers have had long enough to answer."""
+        await asyncio.sleep(delay)
+        if self._ready.is_set():
+            return
+        if self._pending_init:
+            _LOGGER.warning(
+                "IntesisBox %s did not answer %s; continuing without those limits",
+                self._ip,
+                ", ".join(sorted(self._pending_init)),
+            )
+        self._become_ready()
+
+    def _become_ready(self) -> None:
+        """Mark the device ready and start the periodic tasks."""
+        # Guard against cancelling the grace task from inside itself.
+        grace = self._tasks.get("limits_grace")
+        if grace is not None and grace is not asyncio.current_task():
+            self._cancel_task("limits_grace")
+        else:
+            self._tasks.pop("limits_grace", None)
+        self._pending_init.clear()
         self._connectionStatus = API_AUTHENTICATED
         self._reconnect_delay = RECONNECT_MIN_DELAY
-        self._connected.set()
-        _LOGGER.debug("IntesisBox %s connected", self._ip)
+        self._ready.set()
+        _LOGGER.debug("IntesisBox %s ready", self._ip)
         # Availability just changed; tell the entities rather than leaving
         # them to notice on the next status push.
         self._send_update_callback()
@@ -241,7 +315,7 @@ class IntesisBox(asyncio.Protocol):
 
         self._connectionStatus = API_DISCONNECTED
         self._transport = None
-        self._connected.clear()
+        self._ready.clear()
         self._cancel_all_tasks()
         self._fail_change_waiters(ConnectionResetError("Connection lost"))
         self._send_update_callback()
@@ -277,10 +351,11 @@ class IntesisBox(asyncio.Protocol):
                     self._reconnect_delay * 2, RECONNECT_MAX_DELAY
                 )
                 continue
-            # A socket that opens but never answers ID is not a usable device.
+            # A socket that opens but never finishes the handshake is not a
+            # usable device. The budget includes the grace the handshake spends.
             try:
-                async with asyncio.timeout(CONNECT_TIMEOUT):
-                    await self._connected.wait()
+                async with asyncio.timeout(CONNECT_TIMEOUT + LIMITS_GRACE):
+                    await self._ready.wait()
             except TimeoutError:
                 _LOGGER.debug("IntesisBox %s connected but did not answer", self._ip)
                 # connection_lost grows the backoff for this failed attempt.
@@ -320,12 +395,12 @@ class IntesisBox(asyncio.Protocol):
         return False
 
     async def async_connect(self, timeout: float = 30) -> bool:
-        """Connect and wait until the device has answered ID.
+        """Connect and wait until the device has finished its handshake.
 
-        Returns True once connected, False if the device could not be reached
-        or did not identify itself within the timeout. Either failure leaves
-        the reconnect loop running. If an attempt is already under way this
-        joins it rather than opening a second socket.
+        Returns True once ready, False if the device could not be reached or
+        did not finish within the timeout. Either failure leaves the reconnect
+        loop running. If an attempt is already under way this joins it rather
+        than opening a second socket.
         """
         self._stopped = False
         if self.is_connected:
@@ -339,9 +414,9 @@ class IntesisBox(asyncio.Protocol):
                 return False
         try:
             async with asyncio.timeout(timeout):
-                await self._connected.wait()
+                await self._ready.wait()
         except TimeoutError:
-            _LOGGER.debug("IntesisBox %s did not answer ID", self._ip)
+            _LOGGER.debug("IntesisBox %s did not complete the handshake", self._ip)
             self._close_transport()
             self._schedule_reconnect()
             return False
@@ -372,7 +447,7 @@ class IntesisBox(asyncio.Protocol):
         """Shut down connectivity with the device and cancel all tasks."""
         self._stopped = True
         self._connectionStatus = API_DISCONNECTED
-        self._connected.clear()
+        self._ready.clear()
         self._cancel_all_tasks()
         self._fail_change_waiters(ConnectionResetError("Stopped"))
         self._close_transport()
@@ -420,10 +495,13 @@ class IntesisBox(asyncio.Protocol):
             await self._send("PING")
 
     async def poll_status(self):
-        """Periodically request a full status refresh."""
+        """Periodically request a full status refresh.
+
+        The handshake already asked for one, so the first poll waits.
+        """
         while True:
-            await self._send("GET,1:*")
             await asyncio.sleep(STATUS_POLL_INTERVAL)
+            await self._send("GET,1:*")
 
     async def poll_ambtemp(self):
         """Periodically refresh the ambient temperature."""
@@ -432,16 +510,8 @@ class IntesisBox(asyncio.Protocol):
             await self._send(f"GET,1:{FUNCTION_AMBTEMP}")
 
     async def query_initial_state(self):
-        """Fetch identification and limits from the device upon connection."""
-        cmds = [
-            "ID",
-            "LIMITS:SETPTEMP",
-            "LIMITS:FANSP",
-            "LIMITS:MODE",
-            "LIMITS:VANEUD",
-            "LIMITS:VANELR",
-        ]
-        for cmd in cmds:
+        """Fetch identification, limits and a status dump upon connection."""
+        for cmd in INIT_COMMANDS:
             await self._send(cmd)
 
     def _write(self, cmd):
@@ -506,12 +576,18 @@ class IntesisBox(asyncio.Protocol):
         cmd, args = cmdList
         if cmd == "ID":
             if self._parse_id_received(args):
-                self._become_connected()
+                self._mark_init_complete("ID")
             return False
         if cmd == "CHN,1":
-            return self._parse_change_received(args)
+            changed = self._parse_change_received(args)
+            if changed:
+                self._mark_init_complete(INIT_STATUS)
+            return changed
         if cmd == "LIMITS":
-            return self._parse_limits_received(args)
+            function = self._parse_limits_received(args)
+            if function is not None:
+                self._mark_init_complete(f"LIMITS:{function}")
+            return function is not None
         return False
 
     def _handle_error_response(self) -> bool:
@@ -582,12 +658,12 @@ class IntesisBox(asyncio.Protocol):
         self._resolve_change_waiters(function, value)
         return True
 
-    def _parse_limits_received(self, args) -> bool:
-        """Parse a LIMITS reply. Returns True if a known limit was updated."""
+    def _parse_limits_received(self, args) -> str | None:
+        """Parse a LIMITS reply. Returns the function it was for, or None."""
         split_args = args.split(",", 1)
         if len(split_args) != 2:
             _LOGGER.warning("Malformed limits message: %r", args)
-            return False
+            return None
 
         function = split_args[0].strip()
         values = [v.strip() for v in split_args[1].strip().strip("[]").split(",")]
@@ -598,7 +674,7 @@ class IntesisBox(asyncio.Protocol):
                 self._setpoint_maximum = int(values[1]) / 10
             except ValueError:
                 _LOGGER.warning("Non-numeric setpoint limits: %r", values)
-                return False
+                return None
         elif function == FUNCTION_FANSP:
             self._fan_speed_list = values
         elif function == FUNCTION_MODE:
@@ -608,7 +684,7 @@ class IntesisBox(asyncio.Protocol):
         elif function == FUNCTION_VANELR:
             self._horizontal_vane_list = values
         else:
-            return False
+            return None
 
         _LOGGER.debug(
             "Updated limits: setpoint=%s-%s fan=%s mode=%s vaneud=%s vanelr=%s",
@@ -619,7 +695,7 @@ class IntesisBox(asyncio.Protocol):
             self._vertical_vane_list,
             self._horizontal_vane_list,
         )
-        return True
+        return function
 
     # ------------------------------------------------------------------
     # Change confirmation
@@ -883,6 +959,8 @@ class IntesisBox(asyncio.Protocol):
             "controller_type": self._controllerType,
             "rssi": self._rssi,
             "connection": self._connectionStatus,
+            "ready": self._ready.is_set(),
+            "pending_init": sorted(self._pending_init),
             "limits": {
                 "setpoint": [self._setpoint_minimum, self._setpoint_maximum],
                 "fan_speeds": list(self._fan_speed_list),
@@ -891,6 +969,7 @@ class IntesisBox(asyncio.Protocol):
                 "vane_horizontal": list(self._horizontal_vane_list),
             },
             "state": dict(self._device),
+            "tasks": sorted(n for n, t in self._tasks.items() if not t.done()),
         }
 
     def _send_update_callback(self):
@@ -913,8 +992,13 @@ class IntesisBox(asyncio.Protocol):
 
     @property
     def is_connected(self) -> bool:
-        """Returns true if the TCP connection is established."""
+        """Returns true once the device is connected and has reported its state."""
         return self._connectionStatus == API_AUTHENTICATED
+
+    @property
+    def is_initialized(self) -> bool:
+        """Returns true once the handshake on the current connection is done."""
+        return self._ready.is_set()
 
     @property
     def error_message(self) -> str | None:

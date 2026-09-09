@@ -48,12 +48,20 @@ class Emulator(asyncio.Protocol):
     silent = False
     #: Answer the next SET with ERR instead of ACK.
     reject_next_set = False
+    #: LIMITS functions the device silently ignores, as real units do for
+    #: capabilities they do not have.
+    unanswered_limits: set[str] = set()
+    #: Functions absent from the device entirely: a unit with no left/right
+    #: vane never mentions VANELR in its status dump.
+    absent_functions: set[str] = set()
     #: Live connections, so a test can drop them.
     connections: list[Emulator] = []
 
     def __init__(self) -> None:
         """Start with a fresh copy of the default device state."""
-        self.state = dict(DEFAULT_STATE)
+        self.state = {
+            k: v for k, v in DEFAULT_STATE.items() if k not in Emulator.absent_functions
+        }
         self.buffer = b""
         #: Every command line received, in order, so tests can check ordering.
         self.received: list[str] = []
@@ -65,6 +73,8 @@ class Emulator(asyncio.Protocol):
         cls.id_banner = ID_GEN1
         cls.silent = False
         cls.reject_next_set = False
+        cls.unanswered_limits = set()
+        cls.absent_functions = set()
         cls.connections = []
 
     @classmethod
@@ -138,6 +148,8 @@ class Emulator(asyncio.Protocol):
             self.send("ACK\r\n")
         elif line.startswith("LIMITS:"):
             function = line.split(":", 1)[1]
+            if function in Emulator.unanswered_limits:
+                return
             if function in LIMITS:
                 self.send(f"LIMITS:{function},{LIMITS[function]}\r\n")
         elif head == "GET":

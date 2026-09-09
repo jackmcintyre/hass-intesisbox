@@ -84,11 +84,8 @@ async def _connect_and_handshake(port: int) -> Any:
     """Connect to the emulator and wait for the handshake to finish."""
     box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
     box.connect()
-    # LIMITS:VANELR is the last query the controller sends on connect, and the
-    # status dump requested on ID follows it.
-    await _wait_until(
-        lambda: bool(box.vane_horizontal_list) and box.ambient_temperature is not None
-    )
+    # Connected now means the whole handshake: ID, limits and the status dump.
+    await _wait_until(lambda: box.is_connected)
     return box
 
 
@@ -231,10 +228,9 @@ async def test_v6_id_banner_field_offsets():
         assert box.device_mac_address == "001DC9A2C911"
         assert box.firmware_version == "v1.0.1"
         assert box.rssi == "-44"
-        assert box.is_connected
+        # Identified is not yet ready: the limits and status are still to come.
+        assert not box.is_connected
     finally:
-        # Never connected a socket, so there is nothing to stop; only the
-        # pollers the ID reply started.
         await _reap_tasks()
 
 
@@ -284,6 +280,7 @@ async def test_periodic_tasks_send_keepalive_and_polls(monkeypatch):
     transport = FakeTransport()
     box.connection_made(transport)
     box.data_received(f"{ID_V6}\r\n".encode())
+    box._become_ready()
     await asyncio.sleep(0.3)
     try:
         assert b"PING\r" in transport.written
@@ -303,7 +300,8 @@ async def test_reconnect_does_not_duplicate_pollers(port):
         await _wait_until(lambda: box.is_connected, timeout=30)
         # Let the handshake and the retired reconnect task finish.
         await _wait_until(
-            lambda: not {"reconnect", "init"} & set(_live_tasks(box)), timeout=15
+            lambda: not {"reconnect", "init", "limits_grace"} & set(_live_tasks(box)),
+            timeout=15,
         )
         assert _live_tasks(box) == [
             "keepalive",
@@ -345,6 +343,7 @@ async def test_stop_cancels_all_tasks(port):
 async def test_silent_device_times_out_the_handshake(monkeypatch, port):
     """A box that accepts TCP and never answers must not count as connected."""
     monkeypatch.setattr(intesisbox, "CONNECT_TIMEOUT", 0.3)
+    monkeypatch.setattr(intesisbox, "LIMITS_GRACE", 0.1)
     Emulator.silent = True
     box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
     try:
@@ -643,3 +642,127 @@ def test_bare_err_with_nothing_outstanding_is_logged(caplog):
     assert "rejected a command" in caplog.text
     assert errors == ["Device rejected a command"]
     assert box.error_message == "Device rejected a command"
+
+
+# --------------------------------------------------------------------------
+# Readiness: connected means identified, limited and dumped
+# --------------------------------------------------------------------------
+
+
+async def test_ready_waits_for_limits_and_the_status_dump(port):
+    """async_connect must not return until the handshake has finished.
+
+    The climate entity builds its mode and fan lists from the LIMITS replies;
+    if setup returns on ID alone they are empty and the platform fails on
+    every restart.
+    """
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        assert await box.async_connect(timeout=15)
+        assert box.is_initialized
+        assert box.fan_speed_list
+        assert box.operation_list
+        assert box.min_setpoint is not None
+        assert box.ambient_temperature is not None
+    finally:
+        await _shutdown(box)
+
+
+async def test_ready_when_device_ignores_a_limits_query(port):
+    """A unit that never answers LIMITS:VANELR must still come up.
+
+    Real units silently ignore queries for capabilities they do not have. A
+    readiness gate that waits for all five replies would leave every entity
+    unavailable for good.
+    """
+    Emulator.unanswered_limits = {"VANELR"}
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        assert await box.async_connect(timeout=20)
+        assert box.is_initialized
+        assert box.operation_list == ["AUTO", "HEAT", "DRY", "COOL", "FAN"]
+        assert box.fan_speed_list == ["AUTO", "1", "2", "3", "4"]
+        assert box.vane_vertical_list == ["AUTO", "1", "2", "3", "SWING"]
+        assert box.vane_horizontal_list == []
+    finally:
+        await _shutdown(box)
+
+
+async def test_ready_on_id_alone_when_no_limits_answered(port):
+    """A device that answers only ID must still come up, with empty limits."""
+    Emulator.unanswered_limits = {"SETPTEMP", "FANSP", "MODE", "VANEUD", "VANELR"}
+    box = intesisbox.IntesisBox("127.0.0.1", port, loop=asyncio.get_running_loop())
+    try:
+        assert await box.async_connect(timeout=20)
+        assert box.device_mac_address == "001DC9A2C911"
+        assert box.operation_list == []
+    finally:
+        await _shutdown(box)
+
+
+async def test_a_late_limits_reply_after_readiness_is_still_applied():
+    """Readiness with a straggler outstanding must not lose the straggler."""
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
+    box.connection_made(FakeTransport())
+    try:
+        box.data_received(f"{ID_V6}\r\n".encode())
+        box._become_ready()
+        assert box.is_connected
+        box.data_received(b"LIMITS:FANSP,[AUTO,1]\r\n")
+        assert box.fan_speed_list == ["AUTO", "1"]
+        assert "limits_grace" not in box._tasks
+    finally:
+        await _shutdown(box)
+
+
+async def test_ready_can_be_forced_from_outside_the_grace_task():
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+    box.connection_made(FakeTransport())
+    try:
+        box._pending_init = {"ID", "LIMITS:FANSP"}
+        box.data_received(f"{ID_V6}\r\n".encode())
+        # Only an optional reply is outstanding: the grace timer is running.
+        assert "limits_grace" in box._tasks
+        assert not box.is_connected
+        box._become_ready()
+        await asyncio.sleep(0)
+        assert box.is_connected
+        assert "limits_grace" not in box._tasks
+    finally:
+        await _shutdown(box)
+
+
+async def test_a_repeated_id_reply_does_not_restart_the_grace_timer(monkeypatch):
+    """Some units push ID unsolicited; that must not push readiness out."""
+    monkeypatch.setattr(intesisbox, "LIMITS_GRACE", 0.3)
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
+    box.connection_made(FakeTransport())
+    try:
+        box.data_received(f"{ID_V6}\r\n".encode())
+        await asyncio.sleep(0.2)
+        box.data_received(f"{ID_V6}\r\n".encode())
+        await asyncio.sleep(0.2)
+        assert box.is_connected
+    finally:
+        await _shutdown(box)
+
+
+async def test_ready_waits_for_the_status_dump_not_a_timer():
+    """With every LIMITS answered, readiness still needs the first CHN line."""
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=asyncio.get_running_loop())
+    box.connection_made(FakeTransport())
+    try:
+        box.data_received(
+            f"{ID_V6}\r\n".encode()
+            + b"LIMITS:SETPTEMP,[160,300]\r\nLIMITS:FANSP,[AUTO,1]\r\n"
+            b"LIMITS:MODE,[AUTO,HEAT]\r\nLIMITS:VANEUD,[AUTO,SWING]\r\n"
+            b"LIMITS:VANELR,[AUTO,SWING]\r\n"
+        )
+        await asyncio.sleep(intesisbox.STATUS_SETTLE + 0.2)
+        assert not box.is_connected
+        box.data_received(b"CHN,1:ONOFF,OFF\r\nCHN,1:MODE,AUTO\r\n")
+        await asyncio.sleep(intesisbox.STATUS_SETTLE + 0.2)
+        assert box.is_connected
+    finally:
+        await _shutdown(box)
