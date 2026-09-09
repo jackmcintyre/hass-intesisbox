@@ -733,6 +733,17 @@ async def test_ready_can_be_forced_from_outside_the_grace_task():
         await _shutdown(box)
 
 
+def test_removed_update_callback_is_not_called():
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=None)
+    calls: list[bool] = []
+    cb = lambda: calls.append(True)  # noqa: E731
+    box.add_update_callback(cb)
+    box.remove_update_callback(cb)
+    box.remove_update_callback(cb)  # tolerated
+    box.data_received(b"CHN,1:MODE,HEAT\r\n")
+    assert not calls
+
+
 async def test_a_repeated_id_reply_does_not_restart_the_grace_timer(monkeypatch):
     """Some units push ID unsolicited; that must not push readiness out."""
     monkeypatch.setattr(intesisbox, "LIMITS_GRACE", 0.3)

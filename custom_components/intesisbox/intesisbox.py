@@ -1014,6 +1014,11 @@ class IntesisBox(asyncio.Protocol):
         """Public method to add a callback subscriber."""
         self._updateCallbacks.append(method)
 
+    def remove_update_callback(self, method):
+        """Stop notifying a subscriber, e.g. an entity being removed."""
+        with contextlib.suppress(ValueError):
+            self._updateCallbacks.remove(method)
+
     def add_error_callback(self, method):
         """Public method to add a callback subscriber."""
         self._errorCallbacks.append(method)

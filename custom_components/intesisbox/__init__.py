@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
-
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
 from .intesisbox import IntesisBox
 
 DOMAIN = "intesisbox"
 PLATFORMS = ["climate"]
+
+# Seconds to wait for the device to finish its handshake before giving up and
+# letting Home Assistant retry the entry.
+SETUP_TIMEOUT = 30
 
 # The controller lives on the entry for the entry's lifetime. Every platform
 # reads it from here, so there is no hand-maintained dict in hass.data to keep
@@ -22,11 +25,13 @@ type IntesisBoxConfigEntry = ConfigEntry[IntesisBox]
 async def async_setup_entry(hass: HomeAssistant, entry: IntesisBoxConfigEntry) -> bool:
     """Connect to the device and load its platforms."""
     host = entry.data[CONF_HOST]
-
     controller = IntesisBox(host, loop=hass.loop)
-    controller.connect()
-    while not controller.is_connected:
-        await asyncio.sleep(0.1)
+
+    # Wait for the whole handshake, not just the TCP connection: the climate
+    # entity needs the LIMITS replies to build its mode and fan lists.
+    if not await controller.async_connect(timeout=SETUP_TIMEOUT):
+        controller.stop()
+        raise ConfigEntryNotReady(f"Timed out connecting to IntesisBox at {host}")
 
     entry.runtime_data = controller
 

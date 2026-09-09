@@ -19,44 +19,9 @@ from homeassistant.const import CONF_HOST, STATE_UNAVAILABLE
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 
+from .test_climate import FakeController
+
 MAC = "001DC9A2C911"
-
-
-class FakeController:
-    """Stands in for IntesisBox with a handshake already completed."""
-
-    def __init__(self) -> None:
-        self.is_connected = True
-        self.device_mac_address = MAC
-        self.device_model = "TO-RC-WMP-1"
-        self.firmware_version = "v1.3.3"
-        self.operation_list = ["AUTO", "HEAT", "DRY", "COOL", "FAN"]
-        self.fan_speed_list = ["AUTO", "1", "2", "3"]
-        self.vane_vertical_list: list[str] = []
-        self.vane_horizontal_list: list[str] = []
-        self.has_swing_control = False
-        self.min_setpoint = 18.0
-        self.max_setpoint = 29.0
-        self.mode = "COOL"
-        self.fan_speed = "AUTO"
-        self.setpoint = 21.0
-        self.ambient_temperature = 24.5
-        self.vertical_swing = None
-        self.horizontal_swing = None
-        self.is_on = True
-        self.stopped = False
-        self._update_callbacks: list = []
-
-    def connect(self) -> None:
-        """Already connected."""
-
-    def stop(self) -> None:
-        """Record the shutdown."""
-        self.stopped = True
-
-    def add_update_callback(self, method) -> None:
-        """Record the entity's callback."""
-        self._update_callbacks.append(method)
 
 
 @pytest.fixture(autouse=True)
@@ -80,10 +45,12 @@ async def _set_up(hass, fake, **entry_kwargs):
 
 async def test_entry_stores_the_controller_and_sets_up_the_climate(hass):
     fake = FakeController()
+    fake.mode, fake.is_on, fake.ambient_temperature = "COOL", True, 24.5
     entry = await _set_up(hass, fake, unique_id=MAC)
 
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data is fake
+    assert fake.connect_timeouts == [30]
     assert DOMAIN not in hass.data
 
     # One device, identified by MAC, and the entity named after it as before.
@@ -132,7 +99,7 @@ async def test_a_failed_platform_unload_keeps_the_controller_running(hass):
 async def test_a_yaml_platform_keeps_its_configured_name(hass):
     """The YAML path registers no device, so the entity keeps its own name."""
     fake = FakeController()
-    with patch("custom_components.intesisbox.intesisbox.IntesisBox", return_value=fake):
+    with patch("custom_components.intesisbox.climate.IntesisBox", return_value=fake):
         assert await async_setup_component(
             hass,
             "climate",
@@ -143,3 +110,42 @@ async def test_a_yaml_platform_keeps_its_configured_name(hass):
     state = hass.states.get("climate.lounge")
     assert state is not None
     assert state.attributes["friendly_name"] == "Lounge"
+
+
+async def test_a_failed_handshake_leaves_the_entry_retrying(hass):
+    """ConfigEntryNotReady, and the controller it opened is stopped."""
+    fake = FakeController()
+    fake.connect_result = False
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=MAC, data={CONF_HOST: "192.0.2.1"})
+    entry.add_to_hass(hass)
+
+    with patch("custom_components.intesisbox.IntesisBox", return_value=fake):
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert fake.stopped is True
+
+
+async def test_a_push_from_the_device_reaches_the_entity(hass):
+    """State written on the controller's callback, not on a poll."""
+    fake = FakeController()
+    await _set_up(hass, fake, unique_id=MAC)
+    assert hass.states.get("climate.001dc9a2c911").state == "off"
+
+    fake.mode, fake.is_on = "HEAT", True
+    fake.push()
+    await hass.async_block_till_done()
+
+    assert hass.states.get("climate.001dc9a2c911").state == "heat"
+
+
+async def test_losing_the_socket_makes_the_entity_unavailable(hass):
+    fake = FakeController()
+    await _set_up(hass, fake, unique_id=MAC)
+
+    fake.is_connected = False
+    fake.push()
+    await hass.async_block_till_done()
+
+    assert hass.states.get("climate.001dc9a2c911").state == STATE_UNAVAILABLE
