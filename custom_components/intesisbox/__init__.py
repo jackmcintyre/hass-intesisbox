@@ -10,6 +10,8 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from .intesisbox import IntesisBox
 
 DOMAIN = "intesisbox"
+CONF_ENABLE_SWING = "enable_swing"
+CONF_TWO_STAGE_FAN = "two_stage_fan"
 # climate first: it is the entity people look for. The diagnostics attach to
 # the same device.
 PLATFORMS = ["climate", "binary_sensor", "sensor"]

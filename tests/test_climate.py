@@ -11,6 +11,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.intesisbox import (
+    CONF_ENABLE_SWING,
+    CONF_TWO_STAGE_FAN,
+    DOMAIN,
+)
 from custom_components.intesisbox.climate import IntesisBoxAC
 from homeassistant.components.climate import ClimateEntityFeature, HVACMode
 from homeassistant.components.climate.const import ATTR_HVAC_MODE
@@ -566,3 +573,112 @@ async def test_update_logs_connection_changes(caplog):
         await entity.async_update()
     assert "Lost connection" in caplog.text
     assert "restored" in caplog.text
+
+
+def test_target_temperature_step_and_precision():
+    """Verify target temperature step and precision are 0.5."""
+    entity = make_entity()
+    assert entity.target_temperature_step == 0.5
+    assert entity.precision == 0.5
+
+
+def test_heat_max_temp_clamp():
+    """Verify max temperature is capped to 28.0 when in heat mode."""
+    controller = FakeController()
+    controller.max_setpoint = 31.0
+    entity = make_entity(controller)
+
+    # In COOL or OFF, max_temp reports controller max
+    assert entity.max_temp == 31.0
+
+    # In HEAT mode, max_temp is clamped to 28.0
+    entity._current_operation = HVACMode.HEAT
+    entity._power = True
+    assert entity.hvac_mode == HVACMode.HEAT
+    assert entity.max_temp == 28.0
+
+
+async def test_async_set_temperature_clamps_in_heat_mode():
+    """Verify async_set_temperature clamps to 28.0 when heating."""
+    controller = FakeController()
+    entity = make_entity(controller)
+
+    # In HEAT mode, commanding 30.0 should clamp to 28.0
+    entity._current_operation = HVACMode.HEAT
+    entity._power = True
+    await entity.async_set_temperature(**{ATTR_TEMPERATURE: 30.0})
+    assert controller.calls[-1] == ("temperature", 28.0)
+    assert entity.target_temperature == 28.0
+
+    # Explicit operation mode HEAT in kwargs
+    await entity.async_set_temperature(
+        **{ATTR_TEMPERATURE: 29.5, ATTR_HVAC_MODE: HVACMode.HEAT}
+    )
+    assert controller.calls[-1] == ("temperature", 28.0)
+    assert entity.target_temperature == 28.0
+
+
+def test_swing_disabled_via_options():
+    """Verify swing feature can be disabled via entry options."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        options={CONF_ENABLE_SWING: False},
+    )
+    controller = FakeController(
+        vertical_vane_list=["AUTO", "1", "2", "3", "SWING"],
+        horizontal_vane_list=["AUTO", "1", "SWING"],
+    )
+    entity = make_entity(controller, entry=entry)
+
+    assert not entity.supported_features & ClimateEntityFeature.SWING_MODE
+    assert not entity.supported_features & ClimateEntityFeature.SWING_HORIZONTAL_MODE
+    assert entity.swing_mode is None
+    assert entity.swing_horizontal_mode is None
+    assert entity.swing_modes == []
+    assert entity.swing_horizontal_modes == []
+
+    entity._vane_vertical = "3"
+    entity._vane_horizontal = "swing"
+    attrs = entity.extra_state_attributes
+    assert "vertical_swing" not in attrs
+    assert "horizontal_swing" not in attrs
+
+
+def test_two_stage_fan_option_limits_modes_and_maps_speeds():
+    """Verify two-stage fan option restricts modes to auto, low, high."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        options={CONF_TWO_STAGE_FAN: True},
+    )
+    controller = FakeController(
+        fan_speed_list=["AUTO", "1", "2", "3", "4"],
+    )
+    entity = make_entity(controller, entry=entry)
+
+    assert entity.fan_modes == ["auto", "low", "high"]
+
+    entity._fan_speed = "1"
+    assert entity.fan_mode == "low"
+    entity._fan_speed = "2"
+    assert entity.fan_mode == "low"
+
+    entity._fan_speed = "3"
+    assert entity.fan_mode == "high"
+    entity._fan_speed = "4"
+    assert entity.fan_mode == "high"
+
+    entity._fan_speed = "AUTO"
+    assert entity.fan_mode == "auto"
+
+
+def test_two_stage_fan_without_auto():
+    """Verify two-stage fan option on a unit without auto fan."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        options={CONF_TWO_STAGE_FAN: True},
+    )
+    controller = FakeController(
+        fan_speed_list=["1", "2", "3", "4"],
+    )
+    entity = make_entity(controller, entry=entry)
+    assert entity.fan_modes == ["low", "high"]

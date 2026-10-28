@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 import contextlib
 import logging
+import time
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
@@ -129,6 +130,8 @@ class IntesisBox(asyncio.Protocol):
         self._port = port
         self._mac = None
         self._device: dict[str, str] = {}
+        self._pending_setpoint: str | None = None
+        self._pending_setpoint_time: float = 0.0
         self._connectionStatus = API_DISCONNECTED
         self._transport: asyncio.Transport | None = None
         self._updateCallbacks: list[Callable[[], None]] = []
@@ -627,6 +630,23 @@ class IntesisBox(asyncio.Protocol):
         function, value = parts[0].strip(), parts[1].strip()
         if value in NULL_VALUES:
             value = None
+
+        if function == FUNCTION_SETPOINT:
+            now = time.monotonic()
+            if self._pending_setpoint is not None:
+                if value == self._pending_setpoint:
+                    self._pending_setpoint = None
+                elif (now - self._pending_setpoint_time) < 5.0:
+                    _LOGGER.debug(
+                        "Ignoring stale CHN setpoint %s; pending requested is %s (%.2fs elapsed)",
+                        value,
+                        self._pending_setpoint,
+                        now - self._pending_setpoint_time,
+                    )
+                    return
+                else:
+                    self._pending_setpoint = None
+
         self._device[function] = value
 
         _LOGGER.debug("Updated state: %r", self._device)
@@ -724,7 +744,11 @@ class IntesisBox(asyncio.Protocol):
         """Set the target temperature."""
         # round(), not int(): 22.3 * 10 is 222.999..., and truncation would
         # set the device 0.1 degrees below what the user asked for.
-        await self._set_value(FUNCTION_SETPOINT, round(setpoint * 10))
+        set_temp = round(setpoint * 10)
+        self._pending_setpoint = str(set_temp)
+        self._pending_setpoint_time = time.monotonic()
+        self._device[FUNCTION_SETPOINT] = str(set_temp)
+        await self._set_value(FUNCTION_SETPOINT, set_temp)
 
     async def async_set_fan_speed(self, fan_speed: str) -> None:
         """Set the fan speed."""

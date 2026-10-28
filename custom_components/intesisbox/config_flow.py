@@ -7,11 +7,16 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_HOST
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 
-from . import DOMAIN, SETUP_TIMEOUT
+from . import CONF_ENABLE_SWING, CONF_TWO_STAGE_FAN, DOMAIN, SETUP_TIMEOUT
 from .intesisbox import IntesisBox
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +44,12 @@ class IntesisboxFlowHandler(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg
     """Handle a config flow."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlowWithReload:
+        """Get the options flow for this handler."""
+        return IntesisboxOptionsFlowHandler()
 
     async def _async_try_host(self, host: str, errors: dict[str, str]) -> str | None:
         """Identify the device at host, recording a form error on failure."""
@@ -118,4 +129,32 @@ class IntesisboxFlowHandler(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg
                 STEP_HOST_SCHEMA, user_input or entry.data
             ),
             errors=errors,
+        )
+
+
+class IntesisboxOptionsFlowHandler(OptionsFlowWithReload):
+    """Handle Intesisbox options."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        options = self.config_entry.options
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_ENABLE_SWING,
+                        default=options.get(CONF_ENABLE_SWING, True),
+                    ): bool,
+                    vol.Optional(
+                        CONF_TWO_STAGE_FAN,
+                        default=options.get(CONF_TWO_STAGE_FAN, False),
+                    ): bool,
+                }
+            ),
         )

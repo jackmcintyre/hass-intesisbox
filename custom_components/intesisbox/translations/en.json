@@ -40,5 +40,17 @@
         "name": "Signal strength"
       }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "IntesisBox Options",
+        "description": "Configure optional features for this IntesisBox device.",
+        "data": {
+          "enable_swing": "Enable Swing Mode (vane position control)",
+          "two_stage_fan": "Two-stage fan unit (limit fan speeds to Low, High, and Auto)"
+        }
+      }
+    }
   }
 }

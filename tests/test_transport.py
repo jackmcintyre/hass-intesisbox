@@ -661,3 +661,45 @@ def test_vane_list_prefers_reported_limits_and_tolerates_unknowns():
     box.data_received(b"LIMITS:VANELR,[AUTO,1,SWING]\r\n")
     assert box.vane_horizontal_list == ["AUTO", "1", "SWING"]
     assert box.has_horizontal_vane
+
+
+async def test_setpoint_lease_ignores_stale_change_messages():
+    """Rapid setpoint writes must lease the target to ignore stale echoes."""
+    loop = asyncio.get_running_loop()
+    box = intesisbox.IntesisBox("127.0.0.1", 1, loop=loop)
+
+    # Initial setpoint state from handshake
+    box.data_received(b"CHN,1:SETPTEMP,200\r\n")
+    assert box.setpoint == 20.0
+
+    # Command a new temperature
+    await box.async_set_temperature(22.0)
+    assert box.setpoint == 22.0
+    assert box._pending_setpoint == "220"
+
+    # Gateway echoes old setpoint within 5-second window -> ignored
+    box.data_received(b"CHN,1:SETPTEMP,200\r\n")
+    assert box.setpoint == 22.0
+    assert box._pending_setpoint == "220"
+
+    # An intermediate stale setpoint within 5-second window -> ignored
+    box.data_received(b"CHN,1:SETPTEMP,210\r\n")
+    assert box.setpoint == 22.0
+    assert box._pending_setpoint == "220"
+
+    # Matching echo -> accepted and lease released
+    box.data_received(b"CHN,1:SETPTEMP,220\r\n")
+    assert box.setpoint == 22.0
+    assert box._pending_setpoint is None
+
+    # New command with lease expiring past 5.0 seconds
+    await box.async_set_temperature(23.0)
+    assert box.setpoint == 23.0
+    assert box._pending_setpoint == "230"
+
+    # Simulate 5.1 seconds elapsed
+    box._pending_setpoint_time -= 5.1
+    # Incoming CHN is now accepted because lease expired
+    box.data_received(b"CHN,1:SETPTEMP,215\r\n")
+    assert box.setpoint == 21.5
+    assert box._pending_setpoint is None

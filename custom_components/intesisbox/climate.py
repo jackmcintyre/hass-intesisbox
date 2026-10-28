@@ -14,9 +14,10 @@ from homeassistant.components.climate import (
     HVACMode,
 )
 from homeassistant.components.climate.const import ATTR_HVAC_MODE
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 
-from . import DOMAIN, IntesisBoxConfigEntry
+from . import CONF_ENABLE_SWING, CONF_TWO_STAGE_FAN, DOMAIN, IntesisBoxConfigEntry
 from .intesisbox import MODES, IntesisBox
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,7 +91,9 @@ async def async_setup_entry(
     takes its name from the device, so a fresh install no longer shows a MAC
     address until the user renames it.
     """
-    async_add_entities([IntesisBoxAC(entry.runtime_data, name=entry.title)], True)
+    async_add_entities(
+        [IntesisBoxAC(entry.runtime_data, name=entry.title, entry=entry)], True
+    )
 
 
 class IntesisBoxAC(ClimateEntity):
@@ -105,10 +108,18 @@ class IntesisBoxAC(ClimateEntity):
         controller: IntesisBox,
         name: str | None = None,
         unique_id: str | None = None,
+        entry: ConfigEntry | None = None,
     ):
         """Initialize the thermostat."""
         _LOGGER.debug("Setting up climate device.")
         self._controller = controller
+        self._entry = entry
+        self._enable_swing = (
+            entry.options.get(CONF_ENABLE_SWING, True) if entry else True
+        )
+        self._two_stage_fan = (
+            entry.options.get(CONF_TWO_STAGE_FAN, False) if entry else False
+        )
 
         self._deviceid = controller.device_mac_address
         self._devicename = name or controller.device_mac_address
@@ -207,10 +218,11 @@ class IntesisBoxAC(ClimateEntity):
         # Position is still reported even where the vane cannot be commanded -
         # reading it works on hardware where writing does not.
         attrs = {}
-        if self._vane_vertical is not None:
-            attrs["vertical_swing"] = self._vane_vertical
-        if self._vane_horizontal is not None:
-            attrs["horizontal_swing"] = self._vane_horizontal
+        if self._enable_swing:
+            if self._vane_vertical is not None:
+                attrs["vertical_swing"] = self._vane_vertical
+            if self._vane_horizontal is not None:
+                attrs["horizontal_swing"] = self._vane_horizontal
 
         if self._controller.is_connected:
             attrs["ha_update_type"] = "push"
@@ -226,11 +238,17 @@ class IntesisBoxAC(ClimateEntity):
         temperature = kwargs.get(ATTR_TEMPERATURE)
         operation_mode = kwargs.get(ATTR_HVAC_MODE)
 
+        if temperature is not None:
+            if (operation_mode or self.hvac_mode) == HVACMode.HEAT:
+                temperature = min(temperature, 28.0)
+            self._target_temperature = temperature
+
         if operation_mode:
             await self.async_set_hvac_mode(operation_mode)
 
         if temperature:
             await self._controller.async_set_temperature(temperature)
+            self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode):
         """Set operation mode."""
@@ -349,7 +367,19 @@ class IntesisBoxAC(ClimateEntity):
     @property
     def max_temp(self):
         """Return the maximum temperature for the current mode of operation."""
+        if self.hvac_mode == HVACMode.HEAT:
+            return min(self._max_temp or 28.0, 28.0)
         return self._max_temp
+
+    @property
+    def target_temperature_step(self):
+        """Return the supported step of target temperature."""
+        return 0.5
+
+    @property
+    def precision(self):
+        """Return the precision of the system."""
+        return 0.5
 
     @property
     def is_on(self):
@@ -371,22 +401,37 @@ class IntesisBoxAC(ClimateEntity):
         """Return the current fan mode, or None before the first update."""
         if self._fan_speed is None:
             return None
+        if self._two_stage_fan:
+            if self._fan_speed in ("1", "2"):
+                return "low"
+            if self._fan_speed in ("3", "4"):
+                return "high"
+            if self._fan_speed.upper() == "AUTO":
+                return "auto"
         return FAN_MODE_I_TO_E.get(self._fan_speed, self._fan_speed).lower()
 
     @property
     def swing_mode(self):
         """Return the current up/down vane position."""
+        if not self._enable_swing:
+            return None
         return self._vane_vertical
 
     @property
     def swing_horizontal_mode(self):
         """Return the current left/right vane position."""
+        if not self._enable_swing:
+            return None
         return self._vane_horizontal
 
     @property
     def fan_modes(self):
         """List of available fan modes."""
-        return [FAN_MODE_I_TO_E.get(mode.upper(), mode) for mode in self._fan_list]
+        modes = [FAN_MODE_I_TO_E.get(mode.upper(), mode) for mode in self._fan_list]
+        if self._two_stage_fan:
+            two_stage_allowed = {"auto", "low", "high"}
+            return [m for m in modes if m in two_stage_allowed]
+        return modes
 
     @property
     def swing_modes(self):
@@ -396,14 +441,14 @@ class IntesisBoxAC(ClimateEntity):
         and the option list must move with it or the entity can advertise
         SWING_MODE while offering an empty (or stale) list.
         """
-        if not self._controller.has_vertical_vane:
+        if not self._enable_swing or not self._controller.has_vertical_vane:
             return []
         return [vane_to_ha(v) for v in self._controller.vane_vertical_list]
 
     @property
     def swing_horizontal_modes(self):
         """Available left/right vane positions, read live from the controller."""
-        if not self._controller.has_horizontal_vane:
+        if not self._enable_swing or not self._controller.has_horizontal_vane:
             return []
         return [vane_to_ha(v) for v in self._controller.vane_horizontal_list]
 
@@ -449,8 +494,9 @@ class IntesisBoxAC(ClimateEntity):
         already exists.
         """
         features = self._base_features
-        if self._controller.has_vertical_vane:
-            features |= ClimateEntityFeature.SWING_MODE
-        if self._controller.has_horizontal_vane:
-            features |= ClimateEntityFeature.SWING_HORIZONTAL_MODE
+        if self._enable_swing:
+            if self._controller.has_vertical_vane:
+                features |= ClimateEntityFeature.SWING_MODE
+            if self._controller.has_horizontal_vane:
+                features |= ClimateEntityFeature.SWING_HORIZONTAL_MODE
         return features

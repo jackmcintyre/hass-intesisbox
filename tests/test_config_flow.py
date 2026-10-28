@@ -13,7 +13,11 @@ from unittest.mock import patch
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.intesisbox import DOMAIN
+from custom_components.intesisbox import (
+    CONF_ENABLE_SWING,
+    CONF_TWO_STAGE_FAN,
+    DOMAIN,
+)
 from homeassistant import config_entries
 from homeassistant.const import CONF_HOST
 from homeassistant.data_entry_flow import FlowResultType
@@ -238,3 +242,25 @@ async def test_user_flow_reports_an_unexpected_error(hass):
         )
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "unknown"}
+
+
+async def test_options_flow(hass):
+    """Test options flow to configure options."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=MAC,
+        data={CONF_HOST: "192.0.2.10"},
+        options={CONF_ENABLE_SWING: True, CONF_TWO_STAGE_FAN: False},
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_ENABLE_SWING: False, CONF_TWO_STAGE_FAN: True},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == {CONF_ENABLE_SWING: False, CONF_TWO_STAGE_FAN: True}
